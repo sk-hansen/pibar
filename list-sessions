@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""Session Browser data collector and action runner.
+
+  list-sessions                    -> JSON {sessions:[...], agents:[...]}
+  list-sessions resume AGENT ID    -> resume the session in a new terminal
+  list-sessions peek   AGENT ID    -> show the transcript in a floating terminal
+  list-sessions peek-render AGENT ID  (internal: prints the transcript)
+  list-sessions folder AGENT ID    -> open the session's directory
+  list-sessions copy   AGENT ID    -> copy the session id to the clipboard
+  list-sessions delete AGENT ID    -> permanently delete the session
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+PER_AGENT_CAP = 50
+TITLE_MAX = 90
+
+# icon: Nerd Font glyph verified present in JetBrainsMono Nerd Font's cmap;
+# color: the vendor's brand color, used for the badge and filter pill.
+AGENTS = {
+    "claude":   {"name": "Claude Code", "badge": "CL", "iconFile": "icons/claude.svg",
+                 "icon": chr(0xF4CE), "color": "#D97757"},
+    "codex":    {"name": "Codex",       "badge": "CX", "iconFile": "icons/openai.svg",
+                 "icon": chr(0xF06A9), "color": "#10A37F"},
+    "opencode": {"name": "opencode",    "badge": "OC", "iconFile": "icons/opencode.svg",
+                 "icon": chr(0xF018D), "color": "#E5C07B"},
+    "copilot":  {"name": "Copilot",     "badge": "CP", "iconFile": "icons/githubcopilot.svg",
+                 "icon": chr(0xF4B8), "color": "#8957E5"},
+    "pi":       {"name": "Pi",          "badge": "PI", "iconFile": "",
+                 "icon": chr(0xF0432), "color": "#E06C75"},  # no official logo; π glyph
+    "gemini":   {"name": "Gemini",      "badge": "GM", "iconFile": "icons/googlegemini.svg",
+                 "icon": chr(0xEB54), "color": "#4796E3"},
+}
+
+MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
+TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+
+def clean_title(text):
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    return text[:TITLE_MAX] + "…" if len(text) > TITLE_MAX else text
+
+
+def usable_text(text):
+    t = str(text).strip()
+    return t and not t.startswith("<") and not t.startswith("Caveat:")
+
+
+MAX_LINE = 262144  # 256 KB per transcript line; longer lines are skipped
+
+
+def jsonl_head(path, n):
+    out = []
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                if len(line) > MAX_LINE:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def fmt_size(nbytes):
+    if nbytes < 1024 * 1024:
+        return "%d KB" % max(1, nbytes // 1024)
+    return "%.1f MB" % (nbytes / 1048576)
+
+
+def fmt_dur(seconds):
+    if seconds < 60:
+        return "<1 min"
+    if seconds < 5400:
+        return "%d min" % round(seconds / 60)
+    if seconds < 129600:
+        return "%d h" % round(seconds / 3600)
+    return "%d d" % round(seconds / 86400)
+
+
+def parse_iso(ts):
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def file_span_and_counts(path, needles):
+    """One cheap pass: first/last timestamp + substring counts per needle."""
+    counts = {n: 0 for n in needles}
+    first_ts = last_ts = None
+    model = ""
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                for n in needles:
+                    if n in line:
+                        counts[n] += 1
+                if not model:
+                    m = MODEL_RE.search(line)
+                    if m:
+                        model = m.group(1)
+                m = TS_RE.search(line[:200])
+                if m:
+                    ts = parse_iso(m.group(1))
+                    if ts:
+                        if first_ts is None:
+                            first_ts = ts
+                        last_ts = ts
+    except OSError:
+        pass
+    dur = int(last_ts - first_ts) if first_ts and last_ts else 0
+    return counts, dur, model
+
+
+# --- scanners: cheap listing pass ------------------------------------------
+
+def scan_claude():
+    for path in glob.glob(HOME + "/.claude/projects/*/*.jsonl"):
+        sid = os.path.basename(path)[:-6]
+        title, cwd = "", HOME
+        for obj in jsonl_head(path, 40):
+            if not cwd or cwd == HOME:
+                cwd = obj.get("cwd") or cwd
+            if obj.get("type") == "summary" and obj.get("summary"):
+                title = obj["summary"]
+                break
+            if obj.get("type") == "user" and not title:
+                content = (obj.get("message") or {}).get("content")
+                if isinstance(content, str) and usable_text(content):
+                    title = content
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text" \
+                                and usable_text(part.get("text", "")):
+                            title = part["text"]
+                            break
+        yield {"agent": "claude", "id": sid, "title": title or sid[:8],
+               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+
+
+def scan_codex():
+    for path in glob.glob(HOME + "/.codex/sessions/*/*/*/rollout-*.jsonl"):
+        m = re.search(r"([0-9a-f-]{36})\.jsonl$", path)
+        if not m:
+            continue
+        sid, title, goal, cwd = m.group(1), "", "", HOME
+        for obj in jsonl_head(path, 500):
+            payload = obj.get("payload") or {}
+            if obj.get("type") == "session_meta":
+                cwd = payload.get("cwd") or cwd
+            elif obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+                if usable_text(payload.get("message", "")):
+                    title = payload["message"]
+                    break
+            elif obj.get("type") == "response_item" and payload.get("type") == "message" \
+                    and payload.get("role") == "user":
+                for part in payload.get("content") or []:
+                    if not isinstance(part, dict):
+                        continue
+                    text = part.get("text", "")
+                    if usable_text(text):
+                        title = text
+                        break
+                    if not goal:
+                        gm = re.search(r"<objective>\s*(.+?)\s*</objective>", text, re.S)
+                        if gm:
+                            goal = "Goal: " + gm.group(1)
+                if title:
+                    break
+        mtime = int(os.path.getmtime(path))
+        if not title and not goal:
+            day = datetime.datetime.fromtimestamp(mtime).strftime("%-d %b")
+            title = "Untitled session · " + day
+        yield {"agent": "codex", "id": sid, "title": title or goal,
+               "dir": cwd, "mtime": mtime, "path": path}
+
+
+def scan_opencode():
+    db = HOME + "/.local/share/opencode/opencode.db"
+    if not os.path.exists(db):
+        return
+    try:
+        con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+        rows = con.execute(
+            "select id, title, directory, time_updated, time_created, model, agent,"
+            " cost, tokens_input + tokens_output + tokens_reasoning, slug"
+            " from session where parent_id is null"
+            " order by time_updated desc limit ?", (PER_AGENT_CAP,)).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return
+    for sid, title, directory, upd, created, model, mode, cost, tokens, slug in rows:
+        def sec(t):
+            return int(t / 1000) if t and t > 1e12 else int(t or 0)
+        model_id = ""
+        try:
+            model_id = (json.loads(model) or {}).get("id", "")
+        except (TypeError, ValueError):
+            model_id = str(model or "")
+        meta = []
+        if tokens:
+            meta.append("%.0fk tok" % (tokens / 1000))
+        if cost:
+            meta.append("$%.2f" % cost)
+        if model_id:
+            meta.append(model_id)
+        if upd and created:
+            meta.append(fmt_dur(sec(upd) - sec(created)))
+        if slug:
+            meta.append(slug)
+        yield {"agent": "opencode", "id": sid, "title": title or sid,
+               "dir": directory or HOME, "mtime": sec(upd),
+               "meta": " · ".join(meta)}
+
+
+def scan_copilot():
+    for path in glob.glob(HOME + "/.copilot/history-session-state/*.json"):
+        sid = os.path.splitext(os.path.basename(path))[0]
+        title, cwd = "", HOME
+        try:
+            data = json.load(open(path, errors="replace"))
+            title = data.get("summary") or data.get("title") or ""
+            cwd = data.get("cwd") or HOME
+        except (OSError, ValueError):
+            pass
+        yield {"agent": "copilot", "id": sid, "title": title or sid[:8],
+               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+
+
+def scan_pi():
+    for path in glob.glob(HOME + "/.pi/agent/sessions/**/*.jsonl", recursive=True):
+        title, cwd = "", HOME
+        for obj in jsonl_head(path, 30):
+            cwd = obj.get("cwd") or cwd
+            msg = obj.get("message") or {}
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str) and usable_text(content):
+                    title = content
+                    break
+        yield {"agent": "pi", "id": path, "title": title or os.path.basename(path),
+               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+
+
+def scan_gemini():
+    for path in glob.glob(HOME + "/.gemini/tmp/*/chats/*.json"):
+        title = ""
+        try:
+            data = json.load(open(path, errors="replace"))
+            for msg in data.get("messages") or data.get("history") or []:
+                if msg.get("role") == "user" and usable_text(msg.get("content", "")):
+                    title = msg["content"] if isinstance(msg["content"], str) else ""
+                    break
+        except (OSError, ValueError):
+            pass
+        yield {"agent": "gemini", "id": os.path.basename(path),
+               "title": title or os.path.basename(path), "dir": HOME,
+               "mtime": int(os.path.getmtime(path)), "path": path}
+
+
+SCANNERS = {
+    "claude": scan_claude,
+    "codex": scan_codex,
+    "opencode": scan_opencode,
+    "copilot": scan_copilot,
+    "pi": scan_pi,
+    "gemini": scan_gemini,
+}
+
+# Agents whose sessions we know how to delete.
+DELETABLE = {"claude", "codex", "opencode"}
+# Agents whose transcripts peek can render.
+PEEKABLE = {"claude", "codex", "opencode"}
+
+
+# --- metadata enrichment (only for the sessions that made the cut) ---------
+
+def enrich(s):
+    if "meta" in s:
+        return s
+    path = s.get("path")
+    size = 0
+    try:
+        size = os.path.getsize(path) if path else 0
+    except OSError:
+        pass
+    meta = []
+    if s["agent"] == "claude":
+        counts, dur, model = file_span_and_counts(
+            path, ['"type":"user"', '"type":"assistant"'])
+        msgs = counts['"type":"user"'] + counts['"type":"assistant"']
+        if msgs:
+            meta.append("%d msgs" % msgs)
+        if model:
+            meta.append(model)
+        if dur:
+            meta.append(fmt_dur(dur))
+        meta.append(fmt_size(size))
+    elif s["agent"] == "codex":
+        counts, dur, model = file_span_and_counts(path, ['"ordinal"'])
+        if counts['"ordinal"']:
+            meta.append("%d events" % counts['"ordinal"'])
+        if model:
+            meta.append(model)
+        if dur:
+            meta.append(fmt_dur(dur))
+        meta.append(fmt_size(size))
+    else:
+        if size:
+            meta.append(fmt_size(size))
+    s["meta"] = " · ".join(meta)
+    return s
+
+
+def collect():
+    sessions = []
+    for agent, scan in SCANNERS.items():
+        # A resumed session writes a fresh transcript file with the same id;
+        # keep only the newest file per session id.
+        newest = {}
+        for s in scan():
+            if s["id"] not in newest or s["mtime"] > newest[s["id"]]["mtime"]:
+                newest[s["id"]] = s
+        rows = sorted(newest.values(), key=lambda s: -s["mtime"])[:PER_AGENT_CAP]
+        for s in rows:
+            enrich(s)
+            s.pop("path", None)
+            s["title"] = clean_title(s["title"])
+            s["dirShort"] = s["dir"].replace(HOME, "~")
+            s["agentName"] = AGENTS[agent]["name"]
+            s["badge"] = AGENTS[agent]["badge"]
+            s["icon"] = AGENTS[agent]["icon"]
+            s["iconFile"] = AGENTS[agent]["iconFile"]
+            s["color"] = AGENTS[agent]["color"]
+            s["canDelete"] = agent in DELETABLE
+            s["canPeek"] = agent in PEEKABLE
+        sessions.extend(rows)
+    sessions.sort(key=lambda s: -s["mtime"])
+    present = []
+    for agent in SCANNERS:
+        n = sum(1 for s in sessions if s["agent"] == agent)
+        if n:
+            present.append({"agent": agent, "name": AGENTS[agent]["name"],
+                            "badge": AGENTS[agent]["badge"],
+                            "icon": AGENTS[agent]["icon"],
+                            "iconFile": AGENTS[agent]["iconFile"],
+                            "color": AGENTS[agent]["color"], "count": n})
+    return {"sessions": sessions, "agents": present}
+
+
+# --- actions ----------------------------------------------------------------
+
+ID_PATTERNS = {
+    "claude":   r"^[0-9a-fA-F-]{8,64}$",
+    "codex":    r"^[0-9a-fA-F-]{8,64}$",
+    "opencode": r"^[A-Za-z0-9_-]{4,80}$",
+    "copilot":  r"^[A-Za-z0-9._-]{1,120}$",
+    "gemini":   r"^[A-Za-z0-9._-]{1,120}$",
+}
+
+
+def valid_id(agent, sid):
+    if agent == "pi":  # pi ids are transcript paths; require a real file inside its store
+        real = os.path.realpath(str(sid))
+        return real.startswith(os.path.realpath(HOME + "/.pi/agent/sessions") + os.sep)             and os.path.isfile(real)
+    return re.match(ID_PATTERNS.get(agent, r"$^"), str(sid)) is not None
+
+
+def find(agent, sid):
+    for s in collect()["sessions"]:
+        if s["agent"] == agent and s["id"] == sid:
+            return s
+    return None
+
+
+def spawn(argv):
+    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def open_terminal(script):
+    spawn(["setsid", "uwsm-app", "--", "xdg-terminal-exec", "-e",
+           "bash", "-lc", script])
+
+
+def shq(text):
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def resume(agent, sid):
+    s = find(agent, sid)
+    cwd = s["dir"] if s and os.path.isdir(s["dir"]) else HOME
+    inner = {
+        "claude":   "claude --resume " + shq(sid),
+        "codex":    "codex resume " + shq(sid),
+        "opencode": "opencode -c",
+        "copilot":  "copilot --resume " + shq(sid),
+        "pi":       "pi --session " + shq(sid),
+        "gemini":   "gemini --resume latest",
+    }[agent]
+    open_terminal("cd " + shq(cwd) + " && " + inner +
+                  "; ec=$?; if [ $ec -ne 0 ]; then echo; "
+                  "read -n1 -p '[session-browser] exited with '$ec' — press any key'; fi")
+
+
+def session_files(agent, sid):
+    if agent == "claude":
+        return glob.glob(HOME + "/.claude/projects/*/" + sid + ".jsonl")
+    if agent == "codex":
+        return glob.glob(HOME + "/.codex/sessions/*/*/*/rollout-*" + sid + ".jsonl")
+    return []
+
+
+def peek(agent, sid):
+    me = os.path.abspath(__file__)
+    open_terminal("python3 " + shq(me) + " peek-render " + shq(agent) + " "
+                  + shq(sid) + " | less -R +G")
+
+
+BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
+
+
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_blocks_left = [400]  # hard cap on rendered conversation blocks
+
+
+def render_block(role, text, limit=1500):
+    if _blocks_left[0] <= 0:
+        return
+    _blocks_left[0] -= 1
+    text = CTRL_RE.sub("", str(text)).strip()
+    if not text:
+        return
+    if len(text) > limit:
+        text = text[:limit] + " …[truncated]"
+    label = BOLD + ("● You" if role == "user" else "○ " + role.capitalize()) + RESET
+    print(label + "\n" + text + "\n")
+
+
+def peek_render(agent, sid):
+    s = find(agent, sid)
+    if s:
+        print(DIM + s["agentName"] + " · " + s["dirShort"] + " · " + s["meta"] + RESET + "\n")
+    if agent == "claude":
+        for path in session_files(agent, sid)[:1]:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    role = obj.get("type")
+                    if role not in ("user", "assistant"):
+                        continue
+                    content = (obj.get("message") or {}).get("content")
+                    if isinstance(content, str):
+                        if usable_text(content):
+                            render_block(role, content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text" \
+                                    and usable_text(part.get("text", "")):
+                                render_block(role, part["text"])
+    elif agent == "codex":
+        paths = sorted(session_files(agent, sid), key=os.path.getmtime)
+        for path in paths[-1:]:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    p = obj.get("payload") or {}
+                    if obj.get("type") == "event_msg":
+                        if p.get("type") == "user_message" and usable_text(p.get("message", "")):
+                            render_block("user", p["message"])
+                        elif p.get("type") == "agent_message" and p.get("message"):
+                            render_block("assistant", p["message"])
+    elif agent == "opencode":
+        db = HOME + "/.local/share/opencode/opencode.db"
+        con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+        rows = con.execute(
+            "select m.data, p.data from part p join message m on m.id = p.message_id"
+            " where p.session_id = ? order by p.time_created", (sid,)).fetchall()
+        con.close()
+        for mdata, pdata in rows:
+            try:
+                role = (json.loads(mdata) or {}).get("role", "assistant")
+                part = json.loads(pdata) or {}
+            except ValueError:
+                continue
+            if part.get("type") == "text" and usable_text(part.get("text", "")):
+                render_block(role, part["text"])
+    else:
+        print("No transcript renderer for " + agent)
+
+
+def folder(agent, sid):
+    s = find(agent, sid)
+    cwd = s["dir"] if s and os.path.isdir(s["dir"]) else HOME
+    spawn(["setsid", "uwsm-app", "--", "xdg-open", cwd])
+
+
+def copy_id(agent, sid):
+    subprocess.run(["wl-copy", "--", str(sid)], check=False)
+
+
+def delete(agent, sid):
+    if agent == "opencode":
+        subprocess.run(["opencode", "session", "delete", str(sid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+        return
+    for path in session_files(agent, sid):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+ACTIONS = {"resume": resume, "peek": peek, "peek-render": peek_render,
+           "folder": folder, "copy": copy_id, "delete": delete}
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] in ACTIONS and sys.argv[2] in SCANNERS:
+        if not valid_id(sys.argv[2], sys.argv[3]):
+            sys.exit(2)
+        ACTIONS[sys.argv[1]](sys.argv[2], sys.argv[3])
+    else:
+        json.dump(collect(), sys.stdout)

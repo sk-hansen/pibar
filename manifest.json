@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "sid.sessions",
+  "name": "Session Browser",
+  "version": "1.0.0",
+  "author": "Sudhanshu Gautam",
+  "description": "Browse previous sessions from every AI coding agent on this machine (Claude Code, Codex, opencode, Copilot, Pi, Gemini) and resume any of them in a terminal.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Session Browser",
+    "description": "Click to open the session list; Enter or click a row resumes it in a terminal",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
