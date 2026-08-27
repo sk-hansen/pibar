@@ -209,10 +209,13 @@ Panel {
           Column {
             anchors.left: parent.left
             anchors.leftMargin: Style.space(16)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
             Text {
+              width: parent.width
               text: "Sessions"
               color: root.fg
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -221,9 +224,13 @@ Panel {
             }
 
             Text {
+              width: parent.width
               text: root.scanning ? "Scanning agents…"
                 : (root.sessions.length === 0 ? "No sessions found"
-                  : root.agents.map(a => a.count + " " + a.name).join(" · "))
+                  : (root.agents.length > 4
+                    ? root.sessions.length + " sessions · " + root.agents.length + " agents"
+                    : root.agents.map(a => a.count + " " + a.name).join(" · ")))
+              elide: Text.ElideRight
               color: root.dimmed
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.caption
@@ -353,7 +360,9 @@ Panel {
                 visible: !badge.hasLogo
                 text: row.modelData.icon || row.modelData.badge
                 color: badge.brand
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.family: String(row.modelData.iconFont || "") !== ""
+                  ? row.modelData.iconFont
+                  : (root.bar ? root.bar.fontFamily : Style.font.family)
                 font.pixelSize: Style.font.body
               }
             }

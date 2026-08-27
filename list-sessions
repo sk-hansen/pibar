@@ -22,8 +22,8 @@ HOME = os.path.expanduser("~")
 PER_AGENT_CAP = 50
 TITLE_MAX = 90
 
-# icon: Nerd Font glyph verified present in JetBrainsMono Nerd Font's cmap;
-# color: the vendor's brand color, used for the badge and filter pill.
+# icon: fallback glyph when no SVG is bundled; iconFont optionally selects a
+# dedicated installed font. color is used for the badge and filter pill.
 AGENTS = {
     "claude":   {"name": "Claude Code", "badge": "CL", "iconFile": "icons/claude.svg",
                  "icon": chr(0xF4CE), "color": "#D97757"},
@@ -37,6 +37,8 @@ AGENTS = {
                  "icon": chr(0xF0432), "color": "#E06C75"},  # no official logo; π glyph
     "gemini":   {"name": "Gemini",      "badge": "GM", "iconFile": "icons/googlegemini.svg",
                  "icon": chr(0xEB54), "color": "#4796E3"},
+    "grok":     {"name": "Grok",        "badge": "GR", "iconFile": "",
+                 "icon": chr(0xE904), "iconFont": "omarchy", "color": "#D8D8D8"},
 }
 
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
@@ -51,6 +53,31 @@ def clean_title(text):
 def usable_text(text):
     t = str(text).strip()
     return t and not t.startswith("<") and not t.startswith("Caveat:")
+
+
+def content_text(content):
+    """Return the human-readable text from the common agent content shapes."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts)
+    return ""
+
+
+def marked_subagent(data):
+    """Recognize explicit child-session markers without guessing from IDs."""
+    if not isinstance(data, dict):
+        return False
+    kind = str(data.get("kind") or data.get("thread_source")
+               or data.get("session_kind") or "").lower()
+    return data.get("isSubagent") is True or data.get("is_subagent") is True \
+        or kind in ("subagent", "sub-agent") or kind.startswith("subagent")
 
 
 MAX_LINE = 262144  # 256 KB per transcript line; longer lines are skipped
@@ -128,10 +155,18 @@ def file_span_and_counts(path, needles):
 # --- scanners: cheap listing pass ------------------------------------------
 
 def scan_claude():
+    # Intentionally non-recursive: Claude child transcripts live below
+    # <session-id>/subagents/, while resumable conversations are direct files.
     for path in glob.glob(HOME + "/.claude/projects/*/*.jsonl"):
         sid = os.path.basename(path)[:-6]
         title, cwd = "", HOME
-        for obj in jsonl_head(path, 40):
+        records = jsonl_head(path, 40)
+        first_message = next((obj for obj in records
+                              if obj.get("type") in ("user", "assistant")), {})
+        if sid.startswith("agent-") or (first_message.get("isSidechain") is True
+                                        and first_message.get("agentId")):
+            continue
+        for obj in records:
             if not cwd or cwd == HOME:
                 cwd = obj.get("cwd") or cwd
             if obj.get("type") == "summary" and obj.get("summary"):
@@ -157,7 +192,19 @@ def scan_codex():
         if not m:
             continue
         sid, title, goal, cwd = m.group(1), "", "", HOME
-        for obj in jsonl_head(path, 500):
+        records = jsonl_head(path, 500)
+        own_meta = next((obj.get("payload") or {} for obj in records
+                         if obj.get("type") == "session_meta"
+                         and ((obj.get("payload") or {}).get("id")
+                              or (obj.get("payload") or {}).get("session_id")) == sid), None)
+        if own_meta:
+            source = own_meta.get("source")
+            source_is_subagent = isinstance(source, dict) and (
+                "subagent" in source or "sub_agent" in source)
+            if marked_subagent(own_meta) or own_meta.get("parent_thread_id") \
+                    or source_is_subagent:
+                continue
+        for obj in records:
             payload = obj.get("payload") or {}
             if obj.get("type") == "session_meta":
                 cwd = payload.get("cwd") or cwd
@@ -227,13 +274,45 @@ def scan_opencode():
 
 
 def scan_copilot():
+    # Current Copilot CLI stores one resumable conversation per directory.
+    # Sub-agent activity is interleaved into that parent's events.jsonl, so it
+    # must not be interpreted as another session.
+    for path in glob.glob(HOME + "/.copilot/session-state/*/events.jsonl"):
+        sid = os.path.basename(os.path.dirname(path))
+        title, cwd, child = "", HOME, False
+        for obj in jsonl_head(path, 500):
+            data = obj.get("data") or {}
+            if obj.get("type") == "session.start":
+                sid = data.get("sessionId") or sid
+                context = data.get("context") or {}
+                cwd = context.get("cwd") or data.get("cwd") or cwd
+                title = data.get("name") or title
+                child = marked_subagent(data) or marked_subagent(context) \
+                    or bool(data.get("parentSessionId")
+                            or context.get("parentSessionId"))
+            elif obj.get("type") == "user.message" and not title:
+                text = content_text(data.get("content"))
+                if usable_text(text):
+                    title = text
+            elif obj.get("type") == "session.task_complete" and not title:
+                title = data.get("summary") or ""
+        if child:
+            continue
+        yield {"agent": "copilot", "id": sid, "title": title or sid[:8],
+               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+
+    # Pre-0.0.342 legacy store. Resumed legacy sessions migrate to the modern
+    # directory format and collect() de-duplicates them by session id.
     for path in glob.glob(HOME + "/.copilot/history-session-state/*.json"):
         sid = os.path.splitext(os.path.basename(path))[0]
         title, cwd = "", HOME
         try:
-            data = json.load(open(path, errors="replace"))
+            with open(path, errors="replace") as f:
+                data = json.load(f)
+            if marked_subagent(data) or data.get("parentSessionId"):
+                continue
             title = data.get("summary") or data.get("title") or ""
-            cwd = data.get("cwd") or HOME
+            cwd = data.get("cwd") or (data.get("context") or {}).get("cwd") or HOME
         except (OSError, ValueError):
             pass
         yield {"agent": "copilot", "id": sid, "title": title or sid[:8],
@@ -243,7 +322,12 @@ def scan_copilot():
 def scan_pi():
     for path in glob.glob(HOME + "/.pi/agent/sessions/**/*.jsonl", recursive=True):
         title, cwd = "", HOME
-        for obj in jsonl_head(path, 30):
+        records = jsonl_head(path, 30)
+        header = next((obj for obj in records if obj.get("type") == "session"), None)
+        if not header or marked_subagent(header):
+            continue
+        cwd = header.get("cwd") or cwd
+        for obj in records:
             cwd = obj.get("cwd") or cwd
             msg = obj.get("message") or {}
             if msg.get("role") == "user":
@@ -255,20 +339,118 @@ def scan_pi():
                "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
 
 
+def gemini_project_root(path):
+    marker = os.path.join(os.path.dirname(os.path.dirname(path)), ".project_root")
+    try:
+        with open(marker, errors="replace") as f:
+            root = f.read(4096).strip()
+        if root and os.path.isdir(root):
+            return root
+    except OSError:
+        pass
+    return HOME
+
+
 def scan_gemini():
-    for path in glob.glob(HOME + "/.gemini/tmp/*/chats/*.json"):
-        title = ""
+    # Main sessions use session-*.json[l] directly under chats/. Gemini stores
+    # children under chats/<parent-session-id>/<agent-id>.jsonl.
+    paths = glob.glob(HOME + "/.gemini/tmp/*/chats/session-*.json")
+    paths += glob.glob(HOME + "/.gemini/tmp/*/chats/session-*.jsonl")
+    for path in paths:
+        metadata, messages = {}, []
         try:
-            data = json.load(open(path, errors="replace"))
-            for msg in data.get("messages") or data.get("history") or []:
-                if msg.get("role") == "user" and usable_text(msg.get("content", "")):
-                    title = msg["content"] if isinstance(msg["content"], str) else ""
-                    break
+            if path.endswith(".jsonl"):
+                for obj in jsonl_head(path, 500):
+                    if isinstance(obj.get("$set"), dict):
+                        metadata.update(obj["$set"])
+                    elif obj.get("sessionId") and obj.get("projectHash"):
+                        metadata.update(obj)
+                        messages.extend(obj.get("messages") or [])
+                    elif obj.get("id") and obj.get("type"):
+                        messages.append(obj)
+            else:
+                with open(path, errors="replace") as f:
+                    metadata = json.load(f)
+                messages = metadata.get("messages") or metadata.get("history") or []
         except (OSError, ValueError):
-            pass
-        yield {"agent": "gemini", "id": os.path.basename(path),
-               "title": title or os.path.basename(path), "dir": HOME,
-               "mtime": int(os.path.getmtime(path)), "path": path}
+            continue
+        if marked_subagent(metadata) or metadata.get("parentSessionId"):
+            continue
+        title = metadata.get("summary") or ""
+        if not title:
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                if (msg.get("type") or msg.get("role")) != "user":
+                    continue
+                text = content_text(msg.get("content"))
+                if usable_text(text):
+                    title = text
+                    break
+        sid = metadata.get("sessionId") or os.path.splitext(os.path.basename(path))[0]
+        cwd = gemini_project_root(path)
+        directories = metadata.get("directories") or []
+        if cwd == HOME and directories and isinstance(directories[0], str):
+            cwd = directories[0]
+        yield {"agent": "gemini", "id": sid, "title": title or sid[:8],
+               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+
+
+def grok_home():
+    configured = os.environ.get("GROK_HOME")
+    return os.path.expanduser(configured) if configured else HOME + "/.grok"
+
+
+def grok_child_session_ids(root):
+    """Read Grok's parent-side child registry for pre-session_kind records."""
+    child_ids = set()
+    pattern = root + "/sessions/*/*/subagents/*/meta.json"
+    for path in glob.glob(pattern):
+        child_ids.add(os.path.basename(os.path.dirname(path)))
+        try:
+            with open(path, errors="replace") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for key in ("child_session_id", "session_id", "subagent_id", "id"):
+            value = data.get(key) if isinstance(data, dict) else None
+            if isinstance(value, str) and value:
+                child_ids.add(value)
+    return child_ids
+
+
+def scan_grok():
+    root = grok_home()
+    child_ids = grok_child_session_ids(root)
+    for path in glob.glob(root + "/sessions/*/*/summary.json"):
+        try:
+            with open(path, errors="replace") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        info = data.get("info") or {}
+        sid = info.get("id") or os.path.basename(os.path.dirname(path))
+        # parent_session_id is deliberately not a child marker: Grok also sets
+        # it on normal user-created forks and restored sessions.
+        if sid in child_ids or marked_subagent(data) or data.get("hidden") is True:
+            continue
+        title = data.get("generated_title") or data.get("session_summary") \
+            or data.get("last_turn_summary") or sid[:8]
+        cwd = info.get("cwd") or HOME
+        updated = parse_iso(str(data.get("updated_at") or ""))
+        created = parse_iso(str(data.get("created_at") or ""))
+        meta = []
+        messages = data.get("num_chat_messages")
+        if isinstance(messages, int) and messages:
+            meta.append("%d msgs" % messages)
+        model = data.get("current_model_id")
+        if model:
+            meta.append(str(model))
+        if created and updated and updated > created:
+            meta.append(fmt_dur(updated - created))
+        yield {"agent": "grok", "id": sid, "title": title,
+               "dir": cwd, "mtime": int(updated or os.path.getmtime(path)),
+               "meta": " · ".join(meta), "path": path}
 
 
 SCANNERS = {
@@ -278,6 +460,7 @@ SCANNERS = {
     "copilot": scan_copilot,
     "pi": scan_pi,
     "gemini": scan_gemini,
+    "grok": scan_grok,
 }
 
 # Agents whose sessions we know how to delete.
@@ -344,6 +527,7 @@ def collect():
             s["badge"] = AGENTS[agent]["badge"]
             s["icon"] = AGENTS[agent]["icon"]
             s["iconFile"] = AGENTS[agent]["iconFile"]
+            s["iconFont"] = AGENTS[agent].get("iconFont", "")
             s["color"] = AGENTS[agent]["color"]
             s["canDelete"] = agent in DELETABLE
             s["canPeek"] = agent in PEEKABLE
@@ -357,6 +541,7 @@ def collect():
                             "badge": AGENTS[agent]["badge"],
                             "icon": AGENTS[agent]["icon"],
                             "iconFile": AGENTS[agent]["iconFile"],
+                            "iconFont": AGENTS[agent].get("iconFont", ""),
                             "color": AGENTS[agent]["color"], "count": n})
     return {"sessions": sessions, "agents": present}
 
@@ -369,13 +554,15 @@ ID_PATTERNS = {
     "opencode": r"^[A-Za-z0-9_-]{4,80}$",
     "copilot":  r"^[A-Za-z0-9._-]{1,120}$",
     "gemini":   r"^[A-Za-z0-9._-]{1,120}$",
+    "grok":     r"^[0-9a-fA-F-]{8,64}$",
 }
 
 
 def valid_id(agent, sid):
     if agent == "pi":  # pi ids are transcript paths; require a real file inside its store
         real = os.path.realpath(str(sid))
-        return real.startswith(os.path.realpath(HOME + "/.pi/agent/sessions") + os.sep)             and os.path.isfile(real)
+        store = os.path.realpath(HOME + "/.pi/agent/sessions") + os.sep
+        return real.startswith(store) and os.path.isfile(real)
     return re.match(ID_PATTERNS.get(agent, r"$^"), str(sid)) is not None
 
 
@@ -406,10 +593,11 @@ def resume(agent, sid):
     inner = {
         "claude":   "claude --resume " + shq(sid),
         "codex":    "codex resume " + shq(sid),
-        "opencode": "opencode -c",
+        "opencode": "opencode --session " + shq(sid),
         "copilot":  "copilot --resume " + shq(sid),
         "pi":       "pi --session " + shq(sid),
-        "gemini":   "gemini --resume latest",
+        "gemini":   "gemini --resume " + shq(sid),
+        "grok":     "grok --resume " + shq(sid),
     }[agent]
     open_terminal("cd " + shq(cwd) + " && " + inner +
                   "; ec=$?; if [ $ec -ne 0 ]; then echo; "
