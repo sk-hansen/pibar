@@ -33,10 +33,23 @@ unsandboxed).
   `session_kind` plus child registry. Copilot keeps child events inside the
   parent log, while Pi's built-in subagents run without persistent sessions.
   Explicit user forks remain visible.
-- **Hard bounds at capture time:** at most 50 sessions per agent; transcript
-  lines over 256 KB are skipped, titles capped at 90 characters, and the
-  panel refuses any helper payload over 1 MB before `JSON.parse`. All
-  session-derived text renders as plain text (`Text.PlainText`).
+- **Hard bounds before parsing:** each provider considers at most 128 matching
+  candidates and returns at most 50 sessions. A scan has cumulative ceilings
+  of 1,024 paths, 768 file opens, 64 MiB read, and four seconds. Regular files
+  are opened with no-follow/nonblocking flags and verified with `fstat`; FIFOs,
+  devices, sockets, and leaf symlinks are skipped. JSON files are capped at
+  2 MiB, JSONL title reads at 1 MiB per file, individual lines at 256 KiB,
+  metadata passes at 2 MiB, and the opencode database at 512 MiB with bounded
+  result fields, row counts, SQLite VM work, and a deadline progress handler.
+  The database plus WAL/SHM footprint is conservatively charged in full to the
+  same 64 MiB cumulative allowance, and every auxiliary file receives the same
+  regular-file check.
+- The helper caps its own JSON output at 900 KiB. Independently, the panel
+  terminates collection after six seconds and rejects payloads over 1 MiB
+  before `JSON.parse`. If a cumulative collection ceiling prevents a complete
+  scan, retained rows remain usable and the header reports partial results.
+  Titles are capped at 90 characters; all session-derived text renders as
+  plain text (`Text.PlainText`).
 
 **Actions (each runs only on your explicit click/keypress on that row):**
 
@@ -45,15 +58,19 @@ unsandboxed).
   --resume <id>`, `pi --session <path>`, `gemini --resume <id>`, or `grok
   --resume <id>`) in a new terminal via `xdg-terminal-exec`, `cd`'d to the
   session's directory.
-- **Peek** — renders the transcript (control characters stripped, 400-block
-  cap) into a floating terminal with `less`.
+- **Peek** — renders the transcript (control characters stripped) into a
+  floating terminal with `less`, with independent three-second, 8 MiB, and
+  400-block limits. Its opencode query streams at most 400 bounded rows rather
+  than materializing the complete result set.
 - **Folder** — opens the session's directory with `xdg-open`.
 - **Copy ID** — copies the session id with `wl-copy`.
 - **Delete** — permanently removes that one session (transcript files, or
   `opencode session delete`). Requires a second confirming press, and is
   offered only for agents where deletion is well-defined.
 - Session ids are validated against strict per-agent patterns before any
-  action runs; anything else is refused. **No sudo, no pkexec, no polkit.**
+  action runs; anything else is refused. Panel actions have an eight-second
+  watchdog, and synchronous clipboard/deletion commands have their own shorter
+  timeouts. **No sudo, no pkexec, no polkit.**
 
 The screenshot above uses synthetic session names and paths; no private
 transcript data is included in the repository.

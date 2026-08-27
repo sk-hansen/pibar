@@ -14,13 +14,34 @@ import glob
 import json
 import os
 import re
+import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import time
+import urllib.parse
 
 HOME = os.path.expanduser("~")
 PER_AGENT_CAP = 50
 TITLE_MAX = 90
+
+# Collection is intentionally partial under pathological stores. These are
+# cumulative process-level ceilings, not merely UI/output checks.
+CANDIDATE_CAP = 128
+MAX_PATHS = 1024
+MAX_OPEN_FILES = 768
+MAX_SCAN_BYTES = 64 * 1024 * 1024
+SCAN_SECONDS = 4.0
+JSON_FILE_MAX = 2 * 1024 * 1024
+JSONL_HEAD_MAX = 1024 * 1024
+METADATA_FILE_MAX = 2 * 1024 * 1024
+PEEK_FILE_MAX = 8 * 1024 * 1024
+SQLITE_FILE_MAX = 512 * 1024 * 1024
+SQLITE_FIELD_MAX = 256 * 1024
+OUTPUT_MAX = 900 * 1024
+PATH_TEXT_MAX = 1024
+META_TEXT_MAX = 256
 
 # icon: fallback glyph when no SVG is bundled; iconFont optionally selects a
 # dedicated installed font. color is used for the badge and filter pill.
@@ -70,6 +91,14 @@ def content_text(content):
     return ""
 
 
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+
 def marked_subagent(data):
     """Recognize explicit child-session markers without guessing from IDs."""
     if not isinstance(data, dict):
@@ -80,25 +109,334 @@ def marked_subagent(data):
         or kind in ("subagent", "sub-agent") or kind.startswith("subagent")
 
 
-MAX_LINE = 262144  # 256 KB per transcript line; longer lines are skipped
+MAX_LINE = 262144  # 256 KB; readline() never allocates beyond this ceiling
 
 
-def jsonl_head(path, n):
-    out = []
+class ScanBudget:
+    """Shared path, open-file, byte, and wall-clock budget for one operation."""
+
+    def __init__(self, seconds=SCAN_SECONDS, max_paths=MAX_PATHS,
+                 max_open_files=MAX_OPEN_FILES, max_bytes=MAX_SCAN_BYTES):
+        self.deadline = time.monotonic() + max(0.0, seconds)
+        self.max_paths = max_paths
+        self.max_open_files = max_open_files
+        self.max_bytes = max_bytes
+        self.paths = 0
+        self.open_files = 0
+        self.bytes = 0
+        self.reasons = []
+
+    @property
+    def limited(self):
+        return bool(self.reasons)
+
+    def mark(self, reason):
+        if reason not in self.reasons:
+            self.reasons.append(reason)
+
+    def active(self):
+        if time.monotonic() >= self.deadline:
+            self.mark("deadline")
+            return False
+        return True
+
+    def claim_path(self):
+        if not self.active():
+            return False
+        if self.paths >= self.max_paths:
+            self.mark("path limit")
+            return False
+        self.paths += 1
+        return True
+
+    def claim_open(self):
+        if not self.active():
+            return False
+        if self.open_files >= self.max_open_files:
+            self.mark("open-file limit")
+            return False
+        self.open_files += 1
+        return True
+
+    def read_allowance(self, requested):
+        if not self.active():
+            return 0
+        remaining = self.max_bytes - self.bytes
+        if remaining <= 0:
+            self.mark("byte limit")
+            return 0
+        if requested > remaining:
+            self.mark("byte limit")
+        return min(requested, remaining)
+
+    def account(self, amount):
+        self.bytes += max(0, amount)
+
+
+class ScanDeadline(Exception):
+    pass
+
+
+def arm_deadline(budget):
+    """Install a process-level wall timer; return state needed to restore it."""
+    if not hasattr(signal, "setitimer"):
+        return None
     try:
-        with open(path, errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= n:
-                    break
-                if len(line) > MAX_LINE:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    continue
+        old_handler = signal.getsignal(signal.SIGALRM)
+        old_timer = signal.getitimer(signal.ITIMER_REAL)
+
+        def expired(_signum, _frame):
+            raise ScanDeadline()
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL,
+                         max(0.001, budget.deadline - time.monotonic()))
+        return old_handler, old_timer
+    except (AttributeError, ValueError):
+        return None
+
+
+def restore_deadline(state):
+    if state is None:
+        return
+    old_handler, old_timer = state
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, old_handler)
+    if old_timer[0] > 0:
+        signal.setitimer(signal.ITIMER_REAL, *old_timer)
+
+
+def ensure_budget(budget):
+    return budget if budget is not None else ScanBudget()
+
+
+def regular_lstat(path, budget):
+    """Count and accept only a regular, non-symlink path."""
+    if not budget.claim_path():
+        return None
+    try:
+        info = os.lstat(path)
     except OSError:
-        pass
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        budget.mark("non-regular path")
+        return None
+    return info
+
+
+def bounded_paths(patterns, budget, cap=None):
+    """Return at most cap regular matches without materializing an entire glob."""
+    cap = CANDIDATE_CAP if cap is None else cap
+    found, seen = [], set()
+    for pattern, recursive in patterns:
+        for path in glob.iglob(pattern, recursive=recursive):
+            if not budget.active():
+                return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
+            if path in seen:
+                continue
+            if len(found) >= cap:
+                budget.mark("candidate limit")
+                return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
+            seen.add(path)
+            info = regular_lstat(path, budget)
+            if info is not None:
+                found.append((path, info))
+            elif budget.paths >= budget.max_paths:
+                return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
+    return sorted(found, key=lambda item: item[1].st_mtime, reverse=True)
+
+
+def open_regular_fd(path, budget):
+    """Open a leaf without following symlinks and verify it again after open."""
+    if not budget.claim_open():
+        return None, None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            budget.mark("non-regular path")
+            os.close(fd)
+            return None, None
+        return fd, info
+    except OSError:
+        return None, None
+
+
+def iter_regular_lines(path, budget, max_file_bytes, report_truncation=False):
+    """Yield bounded decoded lines from a verified regular file."""
+    fd, info = open_regular_fd(path, budget)
+    if fd is None:
+        return
+    consumed = 0
+    try:
+        # A fixed-size buffer avoids RawIOBase.readline()'s byte-at-a-time
+        # fallback while keeping allocation independent of the source file.
+        with os.fdopen(fd, "rb", buffering=65536) as stream:
+            while consumed < max_file_bytes and budget.active():
+                per_file_left = max_file_bytes - consumed
+                allowance = budget.read_allowance(min(MAX_LINE + 1, per_file_left))
+                if allowance <= 0:
+                    break
+                raw = stream.readline(allowance)
+                if not raw:
+                    break
+                consumed += len(raw)
+                budget.account(len(raw))
+                if not raw.endswith(b"\n") and len(raw) == allowance:
+                    if report_truncation and info.st_size > consumed:
+                        budget.mark("per-file byte limit" if consumed >= max_file_bytes
+                                    else "oversized line")
+                    break
+                yield raw.decode("utf-8", errors="replace")
+            if report_truncation and info.st_size > consumed \
+                    and consumed >= max_file_bytes:
+                budget.mark("per-file byte limit")
+    except OSError:
+        return
+
+
+def read_regular_bytes(path, budget, max_bytes):
+    """Read one complete, size-bounded regular file or return None."""
+    fd, info = open_regular_fd(path, budget)
+    if fd is None:
+        return None
+    try:
+        if info.st_size > max_bytes:
+            budget.mark("per-file byte limit")
+            return None
+        allowance = budget.read_allowance(info.st_size)
+        if allowance < info.st_size:
+            return None
+        chunks, total = [], 0
+        while total < info.st_size and budget.active():
+            chunk = os.read(fd, min(65536, info.st_size - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            budget.account(len(chunk))
+        data = b"".join(chunks)
+        current = os.fstat(fd)
+        if len(data) != info.st_size or current.st_size != info.st_size:
+            budget.mark("file changed during read")
+            return None
+        return data
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def read_json_file(path, budget, max_bytes=JSON_FILE_MAX):
+    raw = read_regular_bytes(path, budget, max_bytes)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def read_small_text(path, budget, max_bytes=4096):
+    raw = read_regular_bytes(path, budget, max_bytes)
+    return raw.decode("utf-8", errors="replace") if raw is not None else ""
+
+
+def jsonl_head(path, n, budget=None, max_file_bytes=JSONL_HEAD_MAX):
+    budget = ensure_budget(budget)
+    out = []
+    lines = iter_regular_lines(path, budget, max_file_bytes)
+    for _index in range(n):
+        try:
+            line = next(lines)
+        except StopIteration:
+            break
+        try:
+            value = json.loads(line)
+            if isinstance(value, dict):
+                out.append(value)
+        except ValueError:
+            continue
     return out
+
+
+def iter_jsonl_records(path, budget, max_records, max_file_bytes=JSONL_HEAD_MAX):
+    lines = iter_regular_lines(path, budget, max_file_bytes)
+    for _index in range(max_records):
+        try:
+            line = next(lines)
+        except StopIteration:
+            return
+        try:
+            value = json.loads(line)
+            if isinstance(value, dict):
+                yield value
+        except ValueError:
+            continue
+
+
+def open_sqlite_readonly(path, budget):
+    """Open a bounded, regular SQLite store with a deadline progress hook."""
+    info = regular_lstat(path, budget)
+    if info is None:
+        return None
+    store_size = info.st_size
+    for suffix in ("-wal", "-shm", "-journal"):
+        auxiliary = path + suffix
+        try:
+            os.lstat(auxiliary)
+        except OSError:
+            continue
+        auxiliary_info = regular_lstat(auxiliary, budget)
+        if auxiliary_info is None:
+            return None
+        store_size += auxiliary_info.st_size
+    if store_size > SQLITE_FILE_MAX:
+        budget.mark("database size limit")
+        return None
+    allowance = budget.read_allowance(store_size)
+    if allowance < store_size:
+        return None
+    # Conservatively charge the complete main/WAL/SHM footprint even though
+    # SQLite will normally touch only a subset of those pages.
+    budget.account(store_size)
+    fd, current = open_regular_fd(path, budget)
+    if fd is None:
+        return None
+    if current.st_dev != info.st_dev or current.st_ino != info.st_ino:
+        budget.mark("file changed during open")
+        os.close(fd)
+        return None
+    uri = "file:" + urllib.parse.quote(os.path.abspath(path), safe="/") + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        latest = os.lstat(path)
+        if not stat.S_ISREG(latest.st_mode) or latest.st_dev != current.st_dev \
+                or latest.st_ino != current.st_ino:
+            budget.mark("file changed during open")
+            connection.close()
+            return None
+        if hasattr(connection, "setlimit"):
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1024 * 1024)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 64 * 1024)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VDBE_OP, 250000)
+        connection.set_progress_handler(lambda: 0 if budget.active() else 1, 1000)
+        connection.execute("pragma query_only = on")
+        connection.execute("pragma temp_store = memory")
+        connection.execute("pragma cache_size = -2048")
+        connection.execute("pragma mmap_size = 0")
+        return connection
+    except (OSError, sqlite3.Error):
+        try:
+            connection.close()
+        except (NameError, sqlite3.Error):
+            pass
+        return None
+    finally:
+        os.close(fd)
 
 
 def fmt_size(nbytes):
@@ -120,60 +458,62 @@ def fmt_dur(seconds):
 def parse_iso(ts):
     try:
         return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except ValueError:
+    except (OSError, OverflowError, ValueError):
         return None
 
 
-def file_span_and_counts(path, needles):
-    """One cheap pass: first/last timestamp + substring counts per needle."""
+def file_span_and_counts(path, needles, budget, size):
+    """Bounded pass for small transcripts; large files report size only."""
     counts = {n: 0 for n in needles}
     first_ts = last_ts = None
     model = ""
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                for n in needles:
-                    if n in line:
-                        counts[n] += 1
-                if not model:
-                    m = MODEL_RE.search(line)
-                    if m:
-                        model = m.group(1)
-                m = TS_RE.search(line[:200])
-                if m:
-                    ts = parse_iso(m.group(1))
-                    if ts:
-                        if first_ts is None:
-                            first_ts = ts
-                        last_ts = ts
-    except OSError:
-        pass
-    dur = int(last_ts - first_ts) if first_ts and last_ts else 0
-    return counts, dur, model
+    if size > METADATA_FILE_MAX:
+        return counts, 0, model, True
+    bytes_before = budget.bytes
+    for line in iter_regular_lines(path, budget, METADATA_FILE_MAX):
+        for needle in needles:
+            if needle in line:
+                counts[needle] += 1
+        if not model:
+            match = MODEL_RE.search(line)
+            if match:
+                model = match.group(1)
+        match = TS_RE.search(line[:200])
+        if match:
+            timestamp = parse_iso(match.group(1))
+            if timestamp:
+                if first_ts is None:
+                    first_ts = timestamp
+                last_ts = timestamp
+    complete = budget.bytes - bytes_before >= size
+    dur = int(last_ts - first_ts) if complete and first_ts and last_ts else 0
+    return counts, dur, model, not complete
 
 
 # --- scanners: cheap listing pass ------------------------------------------
 
-def scan_claude():
+def scan_claude(budget=None):
+    budget = ensure_budget(budget)
     # Intentionally non-recursive: Claude child transcripts live below
     # <session-id>/subagents/, while resumable conversations are direct files.
-    for path in glob.glob(HOME + "/.claude/projects/*/*.jsonl"):
+    paths = bounded_paths([
+        (HOME + "/.claude/projects/*/*.jsonl", False),
+    ], budget)
+    for path, info in paths:
         sid = os.path.basename(path)[:-6]
-        title, cwd = "", HOME
-        records = jsonl_head(path, 40)
-        first_message = next((obj for obj in records
-                              if obj.get("type") in ("user", "assistant")), {})
-        if sid.startswith("agent-") or (first_message.get("isSidechain") is True
-                                        and first_message.get("agentId")):
-            continue
-        for obj in records:
+        title, cwd, child, saw_message = "", HOME, sid.startswith("agent-"), False
+        for obj in iter_jsonl_records(path, budget, 40):
+            if obj.get("type") in ("user", "assistant") and not saw_message:
+                saw_message = True
+                if obj.get("isSidechain") is True and obj.get("agentId"):
+                    child = True
+                    break
             if not cwd or cwd == HOME:
                 cwd = obj.get("cwd") or cwd
             if obj.get("type") == "summary" and obj.get("summary"):
                 title = obj["summary"]
-                break
             if obj.get("type") == "user" and not title:
-                content = (obj.get("message") or {}).get("content")
+                content = as_dict(obj.get("message")).get("content")
                 if isinstance(content, str) and usable_text(content):
                     title = content
                 elif isinstance(content, list):
@@ -182,39 +522,45 @@ def scan_claude():
                                 and usable_text(part.get("text", "")):
                             title = part["text"]
                             break
+            if title and saw_message:
+                break
+        if child or not saw_message:
+            continue
         yield {"agent": "claude", "id": sid, "title": title or sid[:8],
-               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+               "dir": cwd, "mtime": int(info.st_mtime), "path": path,
+               "size": info.st_size}
 
 
-def scan_codex():
-    for path in glob.glob(HOME + "/.codex/sessions/*/*/*/rollout-*.jsonl"):
+def scan_codex(budget=None):
+    budget = ensure_budget(budget)
+    paths = bounded_paths([
+        (HOME + "/.codex/sessions/*/*/*/rollout-*.jsonl", False),
+    ], budget)
+    for path, info in paths:
         m = re.search(r"([0-9a-f-]{36})\.jsonl$", path)
         if not m:
             continue
-        sid, title, goal, cwd = m.group(1), "", "", HOME
-        records = jsonl_head(path, 500)
-        own_meta = next((obj.get("payload") or {} for obj in records
-                         if obj.get("type") == "session_meta"
-                         and ((obj.get("payload") or {}).get("id")
-                              or (obj.get("payload") or {}).get("session_id")) == sid), None)
-        if own_meta:
-            source = own_meta.get("source")
-            source_is_subagent = isinstance(source, dict) and (
-                "subagent" in source or "sub_agent" in source)
-            if marked_subagent(own_meta) or own_meta.get("parent_thread_id") \
-                    or source_is_subagent:
-                continue
-        for obj in records:
-            payload = obj.get("payload") or {}
+        sid, title, goal, cwd, child, saw_meta = m.group(1), "", "", HOME, False, False
+        for obj in iter_jsonl_records(path, budget, 200):
+            payload = as_dict(obj.get("payload"))
             if obj.get("type") == "session_meta":
                 cwd = payload.get("cwd") or cwd
+                own_id = payload.get("id") or payload.get("session_id")
+                if own_id == sid:
+                    saw_meta = True
+                    source = payload.get("source")
+                    source_is_subagent = isinstance(source, dict) and (
+                        "subagent" in source or "sub_agent" in source)
+                    if marked_subagent(payload) or payload.get("parent_thread_id") \
+                            or source_is_subagent:
+                        child = True
+                        break
             elif obj.get("type") == "event_msg" and payload.get("type") == "user_message":
                 if usable_text(payload.get("message", "")):
                     title = payload["message"]
-                    break
             elif obj.get("type") == "response_item" and payload.get("type") == "message" \
                     and payload.get("role") == "user":
-                for part in payload.get("content") or []:
+                for part in as_list(payload.get("content")):
                     if not isinstance(part, dict):
                         continue
                     text = part.get("text", "")
@@ -225,43 +571,65 @@ def scan_codex():
                         gm = re.search(r"<objective>\s*(.+?)\s*</objective>", text, re.S)
                         if gm:
                             goal = "Goal: " + gm.group(1)
-                if title:
-                    break
-        mtime = int(os.path.getmtime(path))
+            if title and saw_meta:
+                break
+        if child or not saw_meta:
+            continue
+        mtime = int(info.st_mtime)
         if not title and not goal:
             day = datetime.datetime.fromtimestamp(mtime).strftime("%-d %b")
             title = "Untitled session · " + day
         yield {"agent": "codex", "id": sid, "title": title or goal,
-               "dir": cwd, "mtime": mtime, "path": path}
+               "dir": cwd, "mtime": mtime, "path": path,
+               "size": info.st_size}
 
 
-def scan_opencode():
+def scan_opencode(budget=None):
+    budget = ensure_budget(budget)
     db = HOME + "/.local/share/opencode/opencode.db"
-    if not os.path.exists(db):
+    con = open_sqlite_readonly(db, budget)
+    if con is None:
         return
     try:
-        con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
-        rows = con.execute(
-            "select id, title, directory, time_updated, time_created, model, agent,"
-            " cost, tokens_input + tokens_output + tokens_reasoning, slug"
+        cursor = con.execute(
+            "select substr(id, 1, 120), substr(title, 1, 1024),"
+            " substr(directory, 1, 1024), time_updated, time_created,"
+            " substr(model, 1, 4096), substr(agent, 1, 128), cost,"
+            " tokens_input + tokens_output + tokens_reasoning, substr(slug, 1, 256)"
             " from session where parent_id is null"
-            " order by time_updated desc limit ?", (PER_AGENT_CAP,)).fetchall()
-        con.close()
+            " order by time_updated desc limit ?", (PER_AGENT_CAP,))
+        rows = []
+        for row in cursor:
+            if not budget.active() or len(rows) >= PER_AGENT_CAP:
+                break
+            rows.append(row)
     except sqlite3.Error:
         return
+    finally:
+        con.close()
     for sid, title, directory, upd, created, model, mode, cost, tokens, slug in rows:
         def sec(t):
-            return int(t / 1000) if t and t > 1e12 else int(t or 0)
+            try:
+                value = float(t or 0)
+                return int(value / 1000) if value > 1e12 else int(value)
+            except (TypeError, ValueError, OverflowError):
+                return 0
         model_id = ""
         try:
-            model_id = (json.loads(model) or {}).get("id", "")
+            model_id = as_dict(json.loads(model)).get("id", "")
         except (TypeError, ValueError):
             model_id = str(model or "")
         meta = []
-        if tokens:
-            meta.append("%.0fk tok" % (tokens / 1000))
-        if cost:
-            meta.append("$%.2f" % cost)
+        try:
+            if float(tokens or 0):
+                meta.append("%.0fk tok" % (float(tokens) / 1000))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            if float(cost or 0):
+                meta.append("$%.2f" % float(cost))
+        except (TypeError, ValueError, OverflowError):
+            pass
         if model_id:
             meta.append(model_id)
         if upd and created:
@@ -273,18 +641,23 @@ def scan_opencode():
                "meta": " · ".join(meta)}
 
 
-def scan_copilot():
+def scan_copilot(budget=None):
+    budget = ensure_budget(budget)
     # Current Copilot CLI stores one resumable conversation per directory.
     # Sub-agent activity is interleaved into that parent's events.jsonl, so it
     # must not be interpreted as another session.
-    for path in glob.glob(HOME + "/.copilot/session-state/*/events.jsonl"):
+    modern = bounded_paths([
+        (HOME + "/.copilot/session-state/*/events.jsonl", False),
+    ], budget)
+    for path, info in modern:
         sid = os.path.basename(os.path.dirname(path))
-        title, cwd, child = "", HOME, False
-        for obj in jsonl_head(path, 500):
-            data = obj.get("data") or {}
+        title, cwd, child, saw_start = "", HOME, False, False
+        for obj in iter_jsonl_records(path, budget, 200):
+            data = as_dict(obj.get("data"))
             if obj.get("type") == "session.start":
+                saw_start = True
                 sid = data.get("sessionId") or sid
-                context = data.get("context") or {}
+                context = as_dict(data.get("context"))
                 cwd = context.get("cwd") or data.get("cwd") or cwd
                 title = data.get("name") or title
                 child = marked_subagent(data) or marked_subagent(context) \
@@ -296,85 +669,96 @@ def scan_copilot():
                     title = text
             elif obj.get("type") == "session.task_complete" and not title:
                 title = data.get("summary") or ""
-        if child:
+            if child or (title and saw_start):
+                break
+        if child or not saw_start:
             continue
         yield {"agent": "copilot", "id": sid, "title": title or sid[:8],
-               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+               "dir": cwd, "mtime": int(info.st_mtime), "path": path,
+               "size": info.st_size}
 
     # Pre-0.0.342 legacy store. Resumed legacy sessions migrate to the modern
     # directory format and collect() de-duplicates them by session id.
-    for path in glob.glob(HOME + "/.copilot/history-session-state/*.json"):
+    legacy = bounded_paths([
+        (HOME + "/.copilot/history-session-state/*.json", False),
+    ], budget)
+    for path, info in legacy:
         sid = os.path.splitext(os.path.basename(path))[0]
         title, cwd = "", HOME
-        try:
-            with open(path, errors="replace") as f:
-                data = json.load(f)
-            if marked_subagent(data) or data.get("parentSessionId"):
-                continue
-            title = data.get("summary") or data.get("title") or ""
-            cwd = data.get("cwd") or (data.get("context") or {}).get("cwd") or HOME
-        except (OSError, ValueError):
-            pass
-        yield {"agent": "copilot", "id": sid, "title": title or sid[:8],
-               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
-
-
-def scan_pi():
-    for path in glob.glob(HOME + "/.pi/agent/sessions/**/*.jsonl", recursive=True):
-        title, cwd = "", HOME
-        records = jsonl_head(path, 30)
-        header = next((obj for obj in records if obj.get("type") == "session"), None)
-        if not header or marked_subagent(header):
+        data = read_json_file(path, budget)
+        if data is None:
             continue
-        cwd = header.get("cwd") or cwd
-        for obj in records:
+        if marked_subagent(data) or data.get("parentSessionId"):
+            continue
+        title = data.get("summary") or data.get("title") or ""
+        cwd = data.get("cwd") or as_dict(data.get("context")).get("cwd") or HOME
+        yield {"agent": "copilot", "id": sid, "title": title or sid[:8],
+               "dir": cwd, "mtime": int(info.st_mtime), "path": path,
+               "size": info.st_size}
+
+
+def scan_pi(budget=None):
+    budget = ensure_budget(budget)
+    paths = bounded_paths([
+        (HOME + "/.pi/agent/sessions/**/*.jsonl", True),
+    ], budget)
+    for path, info in paths:
+        title, cwd, header = "", HOME, None
+        for obj in iter_jsonl_records(path, budget, 30):
+            if obj.get("type") == "session" and header is None:
+                header = obj
+                if marked_subagent(header):
+                    break
+                cwd = header.get("cwd") or cwd
             cwd = obj.get("cwd") or cwd
-            msg = obj.get("message") or {}
+            msg = as_dict(obj.get("message"))
             if msg.get("role") == "user":
                 content = msg.get("content")
                 if isinstance(content, str) and usable_text(content):
                     title = content
                     break
+        if not header or marked_subagent(header):
+            continue
         yield {"agent": "pi", "id": path, "title": title or os.path.basename(path),
-               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+               "dir": cwd, "mtime": int(info.st_mtime), "path": path,
+               "size": info.st_size}
 
 
-def gemini_project_root(path):
+def gemini_project_root(path, budget):
     marker = os.path.join(os.path.dirname(os.path.dirname(path)), ".project_root")
-    try:
-        with open(marker, errors="replace") as f:
-            root = f.read(4096).strip()
-        if root and os.path.isdir(root):
-            return root
-    except OSError:
-        pass
+    root = read_small_text(marker, budget).strip()
+    if root and len(root) <= PATH_TEXT_MAX and os.path.isdir(root):
+        return root
     return HOME
 
 
-def scan_gemini():
+def scan_gemini(budget=None):
+    budget = ensure_budget(budget)
     # Main sessions use session-*.json[l] directly under chats/. Gemini stores
     # children under chats/<parent-session-id>/<agent-id>.jsonl.
-    paths = glob.glob(HOME + "/.gemini/tmp/*/chats/session-*.json")
-    paths += glob.glob(HOME + "/.gemini/tmp/*/chats/session-*.jsonl")
-    for path in paths:
+    paths = bounded_paths([
+        (HOME + "/.gemini/tmp/*/chats/session-*.json", False),
+        (HOME + "/.gemini/tmp/*/chats/session-*.jsonl", False),
+    ], budget)
+    for path, info in paths:
         metadata, messages = {}, []
-        try:
-            if path.endswith(".jsonl"):
-                for obj in jsonl_head(path, 500):
-                    if isinstance(obj.get("$set"), dict):
-                        metadata.update(obj["$set"])
-                    elif obj.get("sessionId") and obj.get("projectHash"):
-                        metadata.update(obj)
-                        messages.extend(obj.get("messages") or [])
-                    elif obj.get("id") and obj.get("type"):
-                        messages.append(obj)
-            else:
-                with open(path, errors="replace") as f:
-                    metadata = json.load(f)
-                messages = metadata.get("messages") or metadata.get("history") or []
-        except (OSError, ValueError):
-            continue
-        if marked_subagent(metadata) or metadata.get("parentSessionId"):
+        if path.endswith(".jsonl"):
+            for obj in iter_jsonl_records(path, budget, 200):
+                if isinstance(obj.get("$set"), dict):
+                    metadata.update(obj["$set"])
+                elif obj.get("sessionId") and obj.get("projectHash"):
+                    metadata.update(obj)
+                    messages.extend(as_list(obj.get("messages")))
+                elif obj.get("id") and obj.get("type"):
+                    messages.append(obj)
+                if marked_subagent(metadata) or metadata.get("parentSessionId"):
+                    break
+        else:
+            metadata = read_json_file(path, budget)
+            if metadata is None:
+                continue
+            messages = as_list(metadata.get("messages") or metadata.get("history"))
+        if not metadata or marked_subagent(metadata) or metadata.get("parentSessionId"):
             continue
         title = metadata.get("summary") or ""
         if not title:
@@ -388,12 +772,13 @@ def scan_gemini():
                     title = text
                     break
         sid = metadata.get("sessionId") or os.path.splitext(os.path.basename(path))[0]
-        cwd = gemini_project_root(path)
-        directories = metadata.get("directories") or []
+        cwd = gemini_project_root(path, budget)
+        directories = as_list(metadata.get("directories"))
         if cwd == HOME and directories and isinstance(directories[0], str):
             cwd = directories[0]
         yield {"agent": "gemini", "id": sid, "title": title or sid[:8],
-               "dir": cwd, "mtime": int(os.path.getmtime(path)), "path": path}
+               "dir": cwd, "mtime": int(info.st_mtime), "path": path,
+               "size": info.st_size}
 
 
 def grok_home():
@@ -401,16 +786,14 @@ def grok_home():
     return os.path.expanduser(configured) if configured else HOME + "/.grok"
 
 
-def grok_child_session_ids(root):
+def grok_child_session_ids(root, budget):
     """Read Grok's parent-side child registry for pre-session_kind records."""
     child_ids = set()
     pattern = root + "/sessions/*/*/subagents/*/meta.json"
-    for path in glob.glob(pattern):
+    for path, _info in bounded_paths([(pattern, False)], budget):
         child_ids.add(os.path.basename(os.path.dirname(path)))
-        try:
-            with open(path, errors="replace") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
+        data = read_json_file(path, budget)
+        if data is None:
             continue
         for key in ("child_session_id", "session_id", "subagent_id", "id"):
             value = data.get(key) if isinstance(data, dict) else None
@@ -419,16 +802,18 @@ def grok_child_session_ids(root):
     return child_ids
 
 
-def scan_grok():
+def scan_grok(budget=None):
+    budget = ensure_budget(budget)
     root = grok_home()
-    child_ids = grok_child_session_ids(root)
-    for path in glob.glob(root + "/sessions/*/*/summary.json"):
-        try:
-            with open(path, errors="replace") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
+    child_ids = grok_child_session_ids(root, budget)
+    summaries = bounded_paths([
+        (root + "/sessions/*/*/summary.json", False),
+    ], budget)
+    for path, file_info in summaries:
+        data = read_json_file(path, budget)
+        if data is None:
             continue
-        info = data.get("info") or {}
+        info = as_dict(data.get("info"))
         sid = info.get("id") or os.path.basename(os.path.dirname(path))
         # parent_session_id is deliberately not a child marker: Grok also sets
         # it on normal user-created forks and restored sessions.
@@ -449,8 +834,9 @@ def scan_grok():
         if created and updated and updated > created:
             meta.append(fmt_dur(updated - created))
         yield {"agent": "grok", "id": sid, "title": title,
-               "dir": cwd, "mtime": int(updated or os.path.getmtime(path)),
-               "meta": " · ".join(meta), "path": path}
+               "dir": cwd, "mtime": int(updated or file_info.st_mtime),
+               "meta": " · ".join(meta), "path": path,
+               "size": file_info.st_size}
 
 
 SCANNERS = {
@@ -471,34 +857,31 @@ PEEKABLE = {"claude", "codex", "opencode"}
 
 # --- metadata enrichment (only for the sessions that made the cut) ---------
 
-def enrich(s):
+def enrich(s, budget):
     if "meta" in s:
         return s
     path = s.get("path")
-    size = 0
-    try:
-        size = os.path.getsize(path) if path else 0
-    except OSError:
-        pass
+    size = int(s.get("size") or 0)
     meta = []
     if s["agent"] == "claude":
-        counts, dur, model = file_span_and_counts(
-            path, ['"type":"user"', '"type":"assistant"'])
+        counts, dur, model, truncated = file_span_and_counts(
+            path, ['"type":"user"', '"type":"assistant"'], budget, size)
         msgs = counts['"type":"user"'] + counts['"type":"assistant"']
         if msgs:
-            meta.append("%d msgs" % msgs)
+            meta.append("%d%s msgs" % (msgs, "+" if truncated else ""))
         if model:
             meta.append(model)
-        if dur:
+        if dur and not truncated:
             meta.append(fmt_dur(dur))
         meta.append(fmt_size(size))
     elif s["agent"] == "codex":
-        counts, dur, model = file_span_and_counts(path, ['"ordinal"'])
+        counts, dur, model, truncated = file_span_and_counts(
+            path, ['"ordinal"'], budget, size)
         if counts['"ordinal"']:
-            meta.append("%d events" % counts['"ordinal"'])
+            meta.append("%d%s events" % (counts['"ordinal"'], "+" if truncated else ""))
         if model:
             meta.append(model)
-        if dur:
+        if dur and not truncated:
             meta.append(fmt_dur(dur))
         meta.append(fmt_size(size))
     else:
@@ -508,42 +891,116 @@ def enrich(s):
     return s
 
 
-def collect():
-    sessions = []
-    for agent, scan in SCANNERS.items():
-        # A resumed session writes a fresh transcript file with the same id;
-        # keep only the newest file per session id.
-        newest = {}
-        for s in scan():
-            if s["id"] not in newest or s["mtime"] > newest[s["id"]]["mtime"]:
-                newest[s["id"]] = s
-        rows = sorted(newest.values(), key=lambda s: -s["mtime"])[:PER_AGENT_CAP]
-        for s in rows:
-            enrich(s)
-            s.pop("path", None)
-            s["title"] = clean_title(s["title"])
-            s["dirShort"] = s["dir"].replace(HOME, "~")
-            s["agentName"] = AGENTS[agent]["name"]
-            s["badge"] = AGENTS[agent]["badge"]
-            s["icon"] = AGENTS[agent]["icon"]
-            s["iconFile"] = AGENTS[agent]["iconFile"]
-            s["iconFont"] = AGENTS[agent].get("iconFont", "")
-            s["color"] = AGENTS[agent]["color"]
-            s["canDelete"] = agent in DELETABLE
-            s["canPeek"] = agent in PEEKABLE
-        sessions.extend(rows)
-    sessions.sort(key=lambda s: -s["mtime"])
+def present_agents(sessions):
     present = []
     for agent in SCANNERS:
-        n = sum(1 for s in sessions if s["agent"] == agent)
-        if n:
+        count = sum(1 for session in sessions if session["agent"] == agent)
+        if count:
             present.append({"agent": agent, "name": AGENTS[agent]["name"],
                             "badge": AGENTS[agent]["badge"],
                             "icon": AGENTS[agent]["icon"],
                             "iconFile": AGENTS[agent]["iconFile"],
                             "iconFont": AGENTS[agent].get("iconFont", ""),
-                            "color": AGENTS[agent]["color"], "count": n})
-    return {"sessions": sessions, "agents": present}
+                            "color": AGENTS[agent]["color"], "count": count})
+    return present
+
+
+def normalize_session(session, agent, budget):
+    sid = str(session.get("id") or "")[:120]
+    if not sid:
+        return None
+    directory = str(session.get("dir") or HOME)
+    if len(directory) > PATH_TEXT_MAX:
+        directory = HOME
+        budget.mark("path text limit")
+    title = clean_title(session.get("title") or sid[:8])
+    metadata = str(session.get("meta") or "")[:META_TEXT_MAX]
+    short = "~" + directory[len(HOME):] if directory.startswith(HOME) else directory
+    return {
+        "agent": agent,
+        "id": sid,
+        "title": title,
+        "dir": directory,
+        "dirShort": short,
+        "mtime": int(session.get("mtime") or 0),
+        "meta": metadata,
+        "agentName": AGENTS[agent]["name"],
+        "badge": AGENTS[agent]["badge"],
+        "icon": AGENTS[agent]["icon"],
+        "iconFile": AGENTS[agent]["iconFile"],
+        "iconFont": AGENTS[agent].get("iconFont", ""),
+        "color": AGENTS[agent]["color"],
+        "canDelete": agent in DELETABLE,
+        "canPeek": agent in PEEKABLE,
+    }
+
+
+def collect(budget=None):
+    budget = ensure_budget(budget)
+    sessions = []
+    deadline_state = arm_deadline(budget)
+    try:
+        for agent, scan in SCANNERS.items():
+            if not budget.active():
+                break
+            # A resumed session writes a fresh transcript file with the same
+            # id; keep only the newest file per session id.
+            newest = {}
+            deadline_hit = False
+            try:
+                for session in scan(budget):
+                    sid = str(session.get("id") or "")
+                    if not sid:
+                        continue
+                    if sid not in newest or session["mtime"] > newest[sid]["mtime"]:
+                        newest[sid] = session
+            except ScanDeadline:
+                budget.mark("deadline")
+                deadline_hit = True
+            except (OSError, TypeError, ValueError, sqlite3.Error):
+                continue
+            rows = sorted(newest.values(), key=lambda s: -s["mtime"])[:PER_AGENT_CAP]
+            normalized = []
+            for session in rows:
+                try:
+                    enrich(session, budget)
+                    safe = normalize_session(session, agent, budget)
+                except ScanDeadline:
+                    budget.mark("deadline")
+                    deadline_hit = True
+                    break
+                except (TypeError, ValueError):
+                    continue
+                if safe is not None:
+                    normalized.append(safe)
+            sessions.extend(normalized)
+            if deadline_hit:
+                break
+    except ScanDeadline:
+        budget.mark("deadline")
+    finally:
+        restore_deadline(deadline_state)
+    sessions.sort(key=lambda s: -s["mtime"])
+    return {"sessions": sessions, "agents": present_agents(sessions),
+            "limited": budget.limited, "limitReasons": budget.reasons,
+            "scanStats": {"paths": budget.paths, "files": budget.open_files,
+                          "bytes": budget.bytes}}
+
+
+def encode_payload(payload):
+    """Keep helper output below the panel's independent 1 MiB guard."""
+    while True:
+        encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) <= OUTPUT_MAX:
+            return encoded
+        if not payload.get("sessions"):
+            return '{"sessions":[],"agents":[],"limited":true,' \
+                   '"limitReasons":["output limit"]}'
+        payload["sessions"].pop()
+        payload["agents"] = present_agents(payload["sessions"])
+        payload["limited"] = True
+        if "output limit" not in payload["limitReasons"]:
+            payload["limitReasons"].append("output limit")
 
 
 # --- actions ----------------------------------------------------------------
@@ -562,7 +1019,12 @@ def valid_id(agent, sid):
     if agent == "pi":  # pi ids are transcript paths; require a real file inside its store
         real = os.path.realpath(str(sid))
         store = os.path.realpath(HOME + "/.pi/agent/sessions") + os.sep
-        return real.startswith(store) and os.path.isfile(real)
+        if not real.startswith(store):
+            return False
+        try:
+            return stat.S_ISREG(os.lstat(real).st_mode)
+        except OSError:
+            return False
     return re.match(ID_PATTERNS.get(agent, r"$^"), str(sid)) is not None
 
 
@@ -589,7 +1051,9 @@ def shq(text):
 
 def resume(agent, sid):
     s = find(agent, sid)
-    cwd = s["dir"] if s and os.path.isdir(s["dir"]) else HOME
+    if s is None:
+        return
+    cwd = s["dir"] if os.path.isdir(s["dir"]) else HOME
     inner = {
         "claude":   "claude --resume " + shq(sid),
         "codex":    "codex resume " + shq(sid),
@@ -604,12 +1068,15 @@ def resume(agent, sid):
                   "read -n1 -p '[session-browser] exited with '$ec' — press any key'; fi")
 
 
-def session_files(agent, sid):
+def session_files(agent, sid, budget=None):
+    budget = ensure_budget(budget)
     if agent == "claude":
-        return glob.glob(HOME + "/.claude/projects/*/" + sid + ".jsonl")
-    if agent == "codex":
-        return glob.glob(HOME + "/.codex/sessions/*/*/*/rollout-*" + sid + ".jsonl")
-    return []
+        patterns = [(HOME + "/.claude/projects/*/" + sid + ".jsonl", False)]
+    elif agent == "codex":
+        patterns = [(HOME + "/.codex/sessions/*/*/*/rollout-*" + sid + ".jsonl", False)]
+    else:
+        patterns = []
+    return [path for path, _info in bounded_paths(patterns, budget, cap=8)]
 
 
 def peek(agent, sid):
@@ -642,79 +1109,121 @@ def peek_render(agent, sid):
     s = find(agent, sid)
     if s:
         print(DIM + s["agentName"] + " · " + s["dirShort"] + " · " + s["meta"] + RESET + "\n")
+    budget = ScanBudget(seconds=3.0, max_paths=64, max_open_files=64,
+                        max_bytes=MAX_SCAN_BYTES)
+    deadline_state = arm_deadline(budget)
+    try:
+        render_transcript(agent, sid, budget)
+    except ScanDeadline:
+        print(DIM + "Preview stopped at the 3-second safety limit." + RESET)
+    finally:
+        restore_deadline(deadline_state)
+
+
+def render_transcript(agent, sid, budget):
     if agent == "claude":
-        for path in session_files(agent, sid)[:1]:
-            with open(path, errors="replace") as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        continue
-                    role = obj.get("type")
-                    if role not in ("user", "assistant"):
-                        continue
-                    content = (obj.get("message") or {}).get("content")
-                    if isinstance(content, str):
-                        if usable_text(content):
-                            render_block(role, content)
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text" \
-                                    and usable_text(part.get("text", "")):
-                                render_block(role, part["text"])
+        for path in session_files(agent, sid, budget)[:1]:
+            for line in iter_regular_lines(path, budget, PEEK_FILE_MAX):
+                if _blocks_left[0] <= 0:
+                    break
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                role = obj.get("type")
+                if role not in ("user", "assistant"):
+                    continue
+                content = as_dict(obj.get("message")).get("content")
+                if isinstance(content, str):
+                    if usable_text(content):
+                        render_block(role, content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text" \
+                                and usable_text(part.get("text", "")):
+                            render_block(role, part["text"])
     elif agent == "codex":
-        paths = sorted(session_files(agent, sid), key=os.path.getmtime)
-        for path in paths[-1:]:
-            with open(path, errors="replace") as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        continue
-                    p = obj.get("payload") or {}
-                    if obj.get("type") == "event_msg":
-                        if p.get("type") == "user_message" and usable_text(p.get("message", "")):
-                            render_block("user", p["message"])
-                        elif p.get("type") == "agent_message" and p.get("message"):
-                            render_block("assistant", p["message"])
+        for path in session_files(agent, sid, budget)[:1]:
+            for line in iter_regular_lines(path, budget, PEEK_FILE_MAX):
+                if _blocks_left[0] <= 0:
+                    break
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                payload = as_dict(obj.get("payload"))
+                if obj.get("type") == "event_msg":
+                    if payload.get("type") == "user_message" \
+                            and usable_text(payload.get("message", "")):
+                        render_block("user", payload["message"])
+                    elif payload.get("type") == "agent_message" and payload.get("message"):
+                        render_block("assistant", payload["message"])
     elif agent == "opencode":
         db = HOME + "/.local/share/opencode/opencode.db"
-        con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
-        rows = con.execute(
-            "select m.data, p.data from part p join message m on m.id = p.message_id"
-            " where p.session_id = ? order by p.time_created", (sid,)).fetchall()
-        con.close()
-        for mdata, pdata in rows:
+        con = open_sqlite_readonly(db, budget)
+        if con is not None:
             try:
-                role = (json.loads(mdata) or {}).get("role", "assistant")
-                part = json.loads(pdata) or {}
-            except ValueError:
-                continue
-            if part.get("type") == "text" and usable_text(part.get("text", "")):
-                render_block(role, part["text"])
+                rows = con.execute(
+                    "select m.data, p.data from part p"
+                    " join message m on m.id = p.message_id"
+                    " where p.session_id = ? and length(m.data) <= ?"
+                    " and length(p.data) <= ? order by p.time_created limit 400",
+                    (sid, SQLITE_FIELD_MAX, SQLITE_FIELD_MAX))
+                for mdata, pdata in rows:
+                    if _blocks_left[0] <= 0 or not budget.active():
+                        break
+                    row_bytes = len(str(mdata).encode("utf-8", errors="replace")) \
+                        + len(str(pdata).encode("utf-8", errors="replace"))
+                    if budget.read_allowance(row_bytes) < row_bytes:
+                        break
+                    budget.account(row_bytes)
+                    try:
+                        role = as_dict(json.loads(mdata)).get("role", "assistant")
+                        part = as_dict(json.loads(pdata))
+                    except (TypeError, ValueError):
+                        continue
+                    if part.get("type") == "text" and usable_text(part.get("text", "")):
+                        render_block(role, part["text"])
+            except sqlite3.Error:
+                pass
+            finally:
+                con.close()
     else:
         print("No transcript renderer for " + agent)
 
 
 def folder(agent, sid):
     s = find(agent, sid)
-    cwd = s["dir"] if s and os.path.isdir(s["dir"]) else HOME
+    if s is None:
+        return
+    cwd = s["dir"] if os.path.isdir(s["dir"]) else HOME
     spawn(["setsid", "uwsm-app", "--", "xdg-open", cwd])
 
 
 def copy_id(agent, sid):
-    subprocess.run(["wl-copy", "--", str(sid)], check=False)
+    try:
+        subprocess.run(["wl-copy", "--", str(sid)], check=False, timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def delete(agent, sid):
-    if agent == "opencode":
-        subprocess.run(["opencode", "session", "delete", str(sid)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       check=False)
+    if find(agent, sid) is None:
         return
-    for path in session_files(agent, sid):
+    if agent == "opencode":
         try:
-            os.remove(path)
+            subprocess.run(["opencode", "session", "delete", str(sid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False, timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+    budget = ScanBudget(seconds=1.0, max_paths=32, max_open_files=8,
+                        max_bytes=1024)
+    for path in session_files(agent, sid, budget):
+        try:
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                os.remove(path)
         except OSError:
             pass
 
@@ -723,9 +1232,11 @@ ACTIONS = {"resume": resume, "peek": peek, "peek-render": peek_render,
            "folder": folder, "copy": copy_id, "delete": delete}
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 4 and sys.argv[1] in ACTIONS and sys.argv[2] in SCANNERS:
+    if len(sys.argv) == 1:
+        sys.stdout.write(encode_payload(collect()))
+    elif len(sys.argv) >= 4 and sys.argv[1] in ACTIONS and sys.argv[2] in SCANNERS:
         if not valid_id(sys.argv[2], sys.argv[3]):
             sys.exit(2)
         ACTIONS[sys.argv[1]](sys.argv[2], sys.argv[3])
     else:
-        json.dump(collect(), sys.stdout)
+        sys.exit(2)

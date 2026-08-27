@@ -1,9 +1,12 @@
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -149,6 +152,10 @@ class ScannerTests(unittest.TestCase):
         con.execute("insert into session values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", child)
         con.commit()
         con.close()
+
+        byte_budget = SESSIONS.ScanBudget(seconds=1, max_bytes=1)
+        self.assertEqual(list(SESSIONS.scan_opencode(byte_budget)), [])
+        self.assertIn("byte limit", byte_budget.reasons)
 
         rows = list(SESSIONS.scan_opencode())
         self.assertEqual([item["id"] for item in rows], ["ses_parent"])
@@ -341,6 +348,209 @@ class ScannerTests(unittest.TestCase):
             "grok --resume 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'",
             commands[2],
         )
+
+    def test_special_files_and_leaf_symlinks_are_never_opened(self):
+        project = Path(".claude/projects/-tmp-project")
+        regular_id = "10101010-1010-4010-8010-101010101010"
+        regular = self.write_jsonl(
+            project / f"{regular_id}.jsonl",
+            [{
+                "type": "user",
+                "isSidechain": False,
+                "cwd": str(self.home),
+                "message": {"content": "Regular session"},
+            }],
+        )
+        fifo = self.home / project / "20202020-2020-4020-8020-202020202020.jsonl"
+        os.mkfifo(fifo)
+        symlink = self.home / project / "30303030-3030-4030-8030-303030303030.jsonl"
+        symlink.symlink_to(regular)
+
+        budget = SESSIONS.ScanBudget(seconds=1)
+        started = time.monotonic()
+        rows = list(SESSIONS.scan_claude(budget))
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual([row["id"] for row in rows], [regular_id])
+        self.assertIn("non-regular path", budget.reasons)
+
+    def test_candidate_and_open_file_limits_return_partial_results(self):
+        project = Path(".claude/projects/-tmp-project")
+        for index in range(5):
+            sid = f"40404040-4040-4040-8040-{index:012d}"
+            self.write_jsonl(
+                project / f"{sid}.jsonl",
+                [{"type": "user", "message": {"content": f"Session {index}"}}],
+            )
+
+        with mock.patch.object(SESSIONS, "CANDIDATE_CAP", 3):
+            candidate_budget = SESSIONS.ScanBudget(seconds=1)
+            rows = list(SESSIONS.scan_claude(candidate_budget))
+        self.assertEqual(len(rows), 3)
+        self.assertIn("candidate limit", candidate_budget.reasons)
+
+        open_budget = SESSIONS.ScanBudget(seconds=1, max_open_files=1)
+        rows = list(SESSIONS.scan_claude(open_budget))
+        self.assertEqual(len(rows), 1)
+        self.assertIn("open-file limit", open_budget.reasons)
+
+    def test_byte_and_deadline_budgets_stop_before_parsing(self):
+        path = self.write_text(
+            ".codex/sessions/2026/08/27/rollout-budget.jsonl",
+            json.dumps({"type": "event_msg", "payload": {"message": "x" * 512}})
+            + "\n",
+        )
+        byte_budget = SESSIONS.ScanBudget(seconds=1, max_bytes=64)
+        self.assertEqual(SESSIONS.jsonl_head(path, 10, byte_budget), [])
+        self.assertLessEqual(byte_budget.bytes, 64)
+        self.assertIn("byte limit", byte_budget.reasons)
+
+        deadline_budget = SESSIONS.ScanBudget(seconds=0)
+        self.assertEqual(list(SESSIONS.scan_codex(deadline_budget)), [])
+        self.assertIn("deadline", deadline_budget.reasons)
+
+    def test_process_deadline_interrupts_a_stalled_provider(self):
+        def stalled(_budget):
+            time.sleep(1)
+            yield {
+                "id": "never-reached",
+                "mtime": 0,
+                "title": "stalled",
+                "dir": str(self.home),
+            }
+
+        budget = SESSIONS.ScanBudget(seconds=0.02)
+        started = time.monotonic()
+        with mock.patch.object(SESSIONS, "SCANNERS", {"codex": stalled}):
+            result = SESSIONS.collect(budget)
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(result["sessions"], [])
+        self.assertTrue(result["limited"])
+        self.assertIn("deadline", result["limitReasons"])
+
+    def test_oversized_json_and_fifo_database_are_skipped(self):
+        summary = self.home / ".grok/sessions/project/session/summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.touch()
+        os.truncate(summary, SESSIONS.JSON_FILE_MAX + 1)
+        grok_budget = SESSIONS.ScanBudget(seconds=1)
+        self.assertEqual(list(SESSIONS.scan_grok(grok_budget)), [])
+        self.assertIn("per-file byte limit", grok_budget.reasons)
+
+        database = self.home / ".local/share/opencode/opencode.db"
+        database.parent.mkdir(parents=True)
+        os.mkfifo(database)
+        db_budget = SESSIONS.ScanBudget(seconds=1)
+        started = time.monotonic()
+        self.assertEqual(list(SESSIONS.scan_opencode(db_budget)), [])
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn("non-regular path", db_budget.reasons)
+
+        database.unlink()
+        con = sqlite3.connect(database)
+        con.execute(
+            "create table session (id text, title text, directory text, "
+            "time_updated integer, time_created integer, model text, agent text, "
+            "cost real, tokens_input integer, tokens_output integer, "
+            "tokens_reasoning integer, slug text, parent_id text)"
+        )
+        con.close()
+        os.mkfifo(str(database) + "-wal")
+        auxiliary_budget = SESSIONS.ScanBudget(seconds=1)
+        self.assertEqual(list(SESSIONS.scan_opencode(auxiliary_budget)), [])
+        self.assertIn("non-regular path", auxiliary_budget.reasons)
+
+    def test_opencode_peek_streams_at_most_400_rows(self):
+        database = self.home / ".local/share/opencode/opencode.db"
+        database.parent.mkdir(parents=True)
+        con = sqlite3.connect(database)
+        con.execute("create table message (id text primary key, data text)")
+        con.execute(
+            "create table part (session_id text, message_id text, "
+            "time_created integer, data text)"
+        )
+        for index in range(450):
+            message_id = f"msg-{index}"
+            con.execute("insert into message values (?, ?)",
+                        (message_id, json.dumps({"role": "assistant"})))
+            con.execute("insert into part values (?, ?, ?, ?)",
+                        ("ses_bounded", message_id, index,
+                         json.dumps({"type": "text", "text": "hello"})))
+        con.commit()
+        con.close()
+
+        rendered = []
+        old_find = SESSIONS.find
+        old_render = SESSIONS.render_block
+        SESSIONS.find = lambda _agent, _sid: {
+            "agentName": "opencode", "dirShort": "~", "meta": ""
+        }
+        SESSIONS.render_block = lambda role, text: rendered.append((role, text))
+        SESSIONS._blocks_left[0] = 400
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                SESSIONS.peek_render("opencode", "ses_bounded")
+        finally:
+            SESSIONS.find = old_find
+            SESSIONS.render_block = old_render
+            SESSIONS._blocks_left[0] = 400
+
+        self.assertEqual(len(rendered), 400)
+
+    def test_peek_render_has_an_independent_hard_deadline(self):
+        old_find = SESSIONS.find
+        SESSIONS.find = lambda _agent, _sid: None
+        started = time.monotonic()
+        try:
+            with mock.patch.object(SESSIONS, "render_transcript",
+                                      side_effect=lambda *_args: time.sleep(4)), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                # peek_render uses an explicit three-second budget; patch the
+                # constructor to make that ceiling fast in the fixture.
+                original_budget = SESSIONS.ScanBudget
+
+                def short_budget(*_args, **kwargs):
+                    return original_budget(seconds=0.02,
+                                           max_paths=kwargs.get("max_paths", 64),
+                                           max_open_files=kwargs.get("max_open_files", 64),
+                                           max_bytes=kwargs.get("max_bytes",
+                                                                SESSIONS.MAX_SCAN_BYTES))
+
+                with mock.patch.object(SESSIONS, "ScanBudget", side_effect=short_budget):
+                    SESSIONS.peek_render("codex", "50505050-5050-4050-8050-505050505050")
+        finally:
+            SESSIONS.find = old_find
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn("safety limit", output.getvalue())
+
+    def test_encoded_output_is_bounded_inside_the_helper(self):
+        sessions = []
+        for index in range(400):
+            sessions.append({
+                "agent": "codex",
+                "id": f"{index:012d}",
+                "title": "t" * SESSIONS.TITLE_MAX,
+                "dir": "/" + "d" * SESSIONS.PATH_TEXT_MAX,
+                "dirShort": "/" + "d" * SESSIONS.PATH_TEXT_MAX,
+                "mtime": index,
+                "meta": "m" * SESSIONS.META_TEXT_MAX,
+            })
+        payload = {
+            "sessions": sessions,
+            "agents": SESSIONS.present_agents(sessions),
+            "limited": False,
+            "limitReasons": [],
+            "scanStats": {"paths": 0, "files": 0, "bytes": 0},
+        }
+
+        encoded = SESSIONS.encode_payload(payload)
+        parsed = json.loads(encoded)
+        self.assertLessEqual(len(encoded.encode("utf-8")), SESSIONS.OUTPUT_MAX)
+        self.assertTrue(parsed["limited"])
+        self.assertIn("output limit", parsed["limitReasons"])
+        self.assertLess(len(parsed["sessions"]), 400)
 
 
 if __name__ == "__main__":

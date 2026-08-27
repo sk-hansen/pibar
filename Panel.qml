@@ -18,6 +18,8 @@ Panel {
   property string filter: "all"
   property int selectedIndex: 0
   property bool scanning: false
+  property bool scanLimited: false
+  property string scanNotice: ""
   property bool confirmingDelete: false
   property int copiedIndex: -1
   // Rows slide under a stationary cursor while the panel animates open;
@@ -66,6 +68,9 @@ Panel {
   function refresh() {
     root.selectedIndex = 0
     if (!listProc.running) {
+      root.scanLimited = false
+      root.scanNotice = ""
+      listProc.timedOut = false
       root.scanning = true
       listProc.running = true
     }
@@ -94,7 +99,7 @@ Panel {
   }
 
   function runAction(action, s) {
-    if (!s) return
+    if (!s || actionProc.running) return
     if (action === "delete" && !s.canDelete) return
     if (action === "peek" && !s.canPeek) return
     actionProc.pendingRefresh = (action === "delete")
@@ -130,6 +135,25 @@ Panel {
     onTriggered: root.copiedIndex = -1
   }
 
+  Timer {
+    id: scanDeadline
+    interval: 6000
+    onTriggered: {
+      if (!listProc.running) return
+      listProc.timedOut = true
+      root.scanning = false
+      root.scanLimited = true
+      root.scanNotice = "Scan stopped after 6 seconds"
+      listProc.running = false
+    }
+  }
+
+  Timer {
+    id: actionDeadline
+    interval: 8000
+    onTriggered: if (actionProc.running) actionProc.running = false
+  }
+
   function fmtAge(epoch) {
     var sec = Math.max(0, Math.round(Date.now() / 1000 - Number(epoch)))
     if (sec < 60) return "just now"
@@ -141,23 +165,39 @@ Panel {
   Process {
     id: actionProc
     property bool pendingRefresh: false
+    onRunningChanged: running ? actionDeadline.restart() : actionDeadline.stop()
     onExited: if (pendingRefresh) { pendingRefresh = false; root.refresh() }
   }
 
   Process {
     id: listProc
+    property bool timedOut: false
     command: ["python3", root.helper]
+    onRunningChanged: running ? scanDeadline.restart() : scanDeadline.stop()
+    onExited: root.scanning = false
     stdout: StdioCollector {
+      waitForEnd: true
       onStreamFinished: {
+        if (listProc.timedOut) return
         root.scanning = false
-        if (text.length > 1048576) { root.sessions = []; root.agents = []; return }
+        if (text.length > 1048576) {
+          root.sessions = []
+          root.agents = []
+          root.scanLimited = true
+          root.scanNotice = "Collector output exceeded 1 MiB"
+          return
+        }
         try {
           var parsed = JSON.parse(text)
           root.sessions = parsed.sessions || []
           root.agents = parsed.agents || []
+          root.scanLimited = parsed.limited === true
+          root.scanNotice = root.scanLimited ? "Partial results · scan limit reached" : ""
         } catch (e) {
           root.sessions = []
           root.agents = []
+          root.scanLimited = true
+          root.scanNotice = "Could not read session results"
         }
         if (root.selectedIndex >= root.shown.length)
           root.selectedIndex = Math.max(0, root.shown.length - 1)
@@ -226,10 +266,11 @@ Panel {
             Text {
               width: parent.width
               text: root.scanning ? "Scanning agents…"
-                : (root.sessions.length === 0 ? "No sessions found"
+                : (root.scanNotice !== "" ? root.scanNotice
+                  : (root.sessions.length === 0 ? "No sessions found"
                   : (root.agents.length > 4
                     ? root.sessions.length + " sessions · " + root.agents.length + " agents"
-                    : root.agents.map(a => a.count + " " + a.name).join(" · ")))
+                    : root.agents.map(a => a.count + " " + a.name).join(" · "))))
               elide: Text.ElideRight
               color: root.dimmed
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
