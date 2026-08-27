@@ -545,12 +545,48 @@ class ScannerTests(unittest.TestCase):
             "scanStats": {"paths": 0, "files": 0, "bytes": 0},
         }
 
-        encoded = SESSIONS.encode_payload(payload)
+        original_dumps = json.dumps
+        with mock.patch.object(SESSIONS.json, "dumps", wraps=original_dumps) as dumps:
+            encoded = SESSIONS.encode_payload(payload)
         parsed = json.loads(encoded)
         self.assertLessEqual(len(encoded.encode("utf-8")), SESSIONS.OUTPUT_MAX)
         self.assertTrue(parsed["limited"])
         self.assertIn("output limit", parsed["limitReasons"])
         self.assertLess(len(parsed["sessions"]), 400)
+        self.assertLessEqual(dumps.call_count, 12)
+
+    def test_malformed_nesting_and_terminal_controls_fail_closed(self):
+        nested = self.home / ".grok/sessions/project/session/summary.json"
+        nested.parent.mkdir(parents=True)
+        nested.write_text('{"value":' * 1200 + "null" + "}" * 1200,
+                          encoding="utf-8")
+        budget = SESSIONS.ScanBudget(seconds=1)
+        self.assertIsNone(SESSIONS.read_json_file(nested, budget))
+        self.assertIn("JSON depth limit", budget.reasons)
+        braces_in_text = json.dumps({"value": "{" * 200 + '\\"' + "}" * 200})
+        self.assertIsNotNone(SESSIONS.parse_json_dict(braces_in_text))
+
+        normalized = SESSIONS.normalize_session({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "title": "Safe\x1b]52;c;clipboard\x07 title",
+            "dir": str(self.home) + "/work\x9b31m",
+            "mtime": 1,
+            "meta": "model\x1b[31m red",
+        }, "codex", SESSIONS.ScanBudget(seconds=1))
+        self.assertNotRegex(normalized["title"], r"[\x00-\x1f\x7f-\x9f]")
+        self.assertNotRegex(normalized["dirShort"], r"[\x00-\x1f\x7f-\x9f]")
+        self.assertNotRegex(normalized["meta"], r"[\x00-\x1f\x7f-\x9f]")
+
+        SESSIONS._blocks_left[0] = 1
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                SESSIONS.render_block("assistant\x1b]0;spoof\x07",
+                                      "hello\x1b]52;c;payload\x07")
+        finally:
+            SESSIONS._blocks_left[0] = 400
+        rendered = output.getvalue()
+        self.assertNotIn("\x1b]0;", rendered)
+        self.assertNotIn("\x1b]52;", rendered)
 
 
 if __name__ == "__main__":

@@ -48,8 +48,10 @@ unsandboxed).
   terminates collection after six seconds and rejects payloads over 1 MiB
   before `JSON.parse`. If a cumulative collection ceiling prevents a complete
   scan, retained rows remain usable and the header reports partial results.
-  Titles are capped at 90 characters; all session-derived text renders as
-  plain text (`Text.PlainText`).
+  Output trimming uses a bounded binary search rather than repeatedly walking
+  every row. Titles are capped at 90 characters; all session-derived text is
+  stripped of terminal control bytes and renders as plain text
+  (`Text.PlainText`). Malformed, excessively nested JSON records are skipped.
 
 **Actions (each runs only on your explicit click/keypress on that row):**
 

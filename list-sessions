@@ -35,6 +35,7 @@ MAX_SCAN_BYTES = 64 * 1024 * 1024
 SCAN_SECONDS = 4.0
 JSON_FILE_MAX = 2 * 1024 * 1024
 JSONL_HEAD_MAX = 1024 * 1024
+JSON_DEPTH_MAX = 64
 METADATA_FILE_MAX = 2 * 1024 * 1024
 PEEK_FILE_MAX = 8 * 1024 * 1024
 SQLITE_FILE_MAX = 512 * 1024 * 1024
@@ -64,10 +65,18 @@ AGENTS = {
 
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
 TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+# Keep tab/newline available for transcript layout, but remove every C0/C1
+# byte that a terminal could interpret as an escape or control sequence.
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean_inline(text, limit):
+    text = CTRL_RE.sub("", str(text))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
 def clean_title(text):
-    text = re.sub(r"\s+", " ", str(text)).strip()
+    text = clean_inline(text, TITLE_MAX + 1)
     return text[:TITLE_MAX] + "…" if len(text) > TITLE_MAX else text
 
 
@@ -97,6 +106,41 @@ def as_dict(value):
 
 def as_list(value):
     return value if isinstance(value, list) else []
+
+
+def parse_json_dict(raw, budget=None):
+    """Parse a JSON object only after a cheap, string-aware depth check."""
+    if not isinstance(raw, (str, bytes, bytearray)):
+        return None
+    quote = 34 if not isinstance(raw, str) else '"'
+    slash = 92 if not isinstance(raw, str) else "\\"
+    opens = (91, 123) if not isinstance(raw, str) else ("[", "{")
+    closes = (93, 125) if not isinstance(raw, str) else ("]", "}")
+    in_string = escaped = False
+    depth = 0
+    for char in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == slash:
+                escaped = True
+            elif char == quote:
+                in_string = False
+        elif char == quote:
+            in_string = True
+        elif char in opens:
+            depth += 1
+            if depth > JSON_DEPTH_MAX:
+                if budget is not None:
+                    budget.mark("JSON depth limit")
+                return None
+        elif char in closes:
+            depth -= 1
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
 
 
 def marked_subagent(data):
@@ -333,11 +377,7 @@ def read_json_file(path, budget, max_bytes=JSON_FILE_MAX):
     raw = read_regular_bytes(path, budget, max_bytes)
     if raw is None:
         return None
-    try:
-        value = json.loads(raw)
-        return value if isinstance(value, dict) else None
-    except (UnicodeDecodeError, ValueError):
-        return None
+    return parse_json_dict(raw, budget)
 
 
 def read_small_text(path, budget, max_bytes=4096):
@@ -354,12 +394,9 @@ def jsonl_head(path, n, budget=None, max_file_bytes=JSONL_HEAD_MAX):
             line = next(lines)
         except StopIteration:
             break
-        try:
-            value = json.loads(line)
-            if isinstance(value, dict):
-                out.append(value)
-        except ValueError:
-            continue
+        value = parse_json_dict(line, budget)
+        if value is not None:
+            out.append(value)
     return out
 
 
@@ -370,12 +407,9 @@ def iter_jsonl_records(path, budget, max_records, max_file_bytes=JSONL_HEAD_MAX)
             line = next(lines)
         except StopIteration:
             return
-        try:
-            value = json.loads(line)
-            if isinstance(value, dict):
-                yield value
-        except ValueError:
-            continue
+        value = parse_json_dict(line, budget)
+        if value is not None:
+            yield value
 
 
 def open_sqlite_readonly(path, budget):
@@ -614,11 +648,9 @@ def scan_opencode(budget=None):
                 return int(value / 1000) if value > 1e12 else int(value)
             except (TypeError, ValueError, OverflowError):
                 return 0
-        model_id = ""
-        try:
-            model_id = as_dict(json.loads(model)).get("id", "")
-        except (TypeError, ValueError):
-            model_id = str(model or "")
+        parsed_model = parse_json_dict(model, budget)
+        model_id = clean_inline(parsed_model.get("id", ""), 128) \
+            if parsed_model is not None else clean_inline(model or "", 128)
         meta = []
         try:
             if float(tokens or 0):
@@ -914,8 +946,9 @@ def normalize_session(session, agent, budget):
         directory = HOME
         budget.mark("path text limit")
     title = clean_title(session.get("title") or sid[:8])
-    metadata = str(session.get("meta") or "")[:META_TEXT_MAX]
+    metadata = clean_inline(session.get("meta") or "", META_TEXT_MAX)
     short = "~" + directory[len(HOME):] if directory.startswith(HOME) else directory
+    short = clean_inline(short, PATH_TEXT_MAX)
     return {
         "agent": agent,
         "id": sid,
@@ -957,7 +990,7 @@ def collect(budget=None):
             except ScanDeadline:
                 budget.mark("deadline")
                 deadline_hit = True
-            except (OSError, TypeError, ValueError, sqlite3.Error):
+            except (OSError, TypeError, ValueError, RecursionError, sqlite3.Error):
                 continue
             rows = sorted(newest.values(), key=lambda s: -s["mtime"])[:PER_AGENT_CAP]
             normalized = []
@@ -969,7 +1002,7 @@ def collect(budget=None):
                     budget.mark("deadline")
                     deadline_hit = True
                     break
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     continue
                 if safe is not None:
                     normalized.append(safe)
@@ -988,19 +1021,45 @@ def collect(budget=None):
 
 
 def encode_payload(payload):
-    """Keep helper output below the panel's independent 1 MiB guard."""
-    while True:
-        encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) <= OUTPUT_MAX:
-            return encoded
-        if not payload.get("sessions"):
-            return '{"sessions":[],"agents":[],"limited":true,' \
-                   '"limitReasons":["output limit"]}'
-        payload["sessions"].pop()
-        payload["agents"] = present_agents(payload["sessions"])
-        payload["limited"] = True
-        if "output limit" not in payload["limitReasons"]:
-            payload["limitReasons"].append("output limit")
+    """Keep helper output below the panel guard with logarithmic trimming."""
+    def encode(value):
+        return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+    encoded = encode(payload)
+    if len(encoded.encode("utf-8")) <= OUTPUT_MAX:
+        return encoded
+
+    sessions = list(payload.get("sessions") or [])
+    reasons = list(payload.get("limitReasons") or [])
+    if "output limit" not in reasons:
+        reasons.append("output limit")
+
+    def candidate(count):
+        selected = sessions[:count]
+        value = dict(payload)
+        value.update({"sessions": selected, "agents": present_agents(selected),
+                      "limited": True, "limitReasons": reasons})
+        return value
+
+    best = candidate(0)
+    best_encoded = encode(best)
+    if len(best_encoded.encode("utf-8")) > OUTPUT_MAX:
+        return '{"sessions":[],"agents":[],"limited":true,' \
+               '"limitReasons":["output limit"]}'
+
+    low, high = 1, len(sessions) - 1
+    while low <= high:
+        middle = (low + high) // 2
+        value = candidate(middle)
+        value_encoded = encode(value)
+        if len(value_encoded.encode("utf-8")) <= OUTPUT_MAX:
+            best, best_encoded = value, value_encoded
+            low = middle + 1
+        else:
+            high = middle - 1
+    payload.clear()
+    payload.update(best)
+    return best_encoded
 
 
 # --- actions ----------------------------------------------------------------
@@ -1086,9 +1145,6 @@ def peek(agent, sid):
 
 
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
-
-
-CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _blocks_left = [400]  # hard cap on rendered conversation blocks
 
 
@@ -1101,7 +1157,9 @@ def render_block(role, text, limit=1500):
         return
     if len(text) > limit:
         text = text[:limit] + " …[truncated]"
-    label = BOLD + ("● You" if role == "user" else "○ " + role.capitalize()) + RESET
+    safe_role = clean_inline(role, 24) or "assistant"
+    label = BOLD + ("● You" if safe_role == "user"
+                    else "○ " + safe_role.capitalize()) + RESET
     print(label + "\n" + text + "\n")
 
 
@@ -1126,9 +1184,8 @@ def render_transcript(agent, sid, budget):
             for line in iter_regular_lines(path, budget, PEEK_FILE_MAX):
                 if _blocks_left[0] <= 0:
                     break
-                try:
-                    obj = json.loads(line)
-                except ValueError:
+                obj = parse_json_dict(line, budget)
+                if obj is None:
                     continue
                 role = obj.get("type")
                 if role not in ("user", "assistant"):
@@ -1147,9 +1204,8 @@ def render_transcript(agent, sid, budget):
             for line in iter_regular_lines(path, budget, PEEK_FILE_MAX):
                 if _blocks_left[0] <= 0:
                     break
-                try:
-                    obj = json.loads(line)
-                except ValueError:
+                obj = parse_json_dict(line, budget)
+                if obj is None:
                     continue
                 payload = as_dict(obj.get("payload"))
                 if obj.get("type") == "event_msg":
@@ -1177,11 +1233,11 @@ def render_transcript(agent, sid, budget):
                     if budget.read_allowance(row_bytes) < row_bytes:
                         break
                     budget.account(row_bytes)
-                    try:
-                        role = as_dict(json.loads(mdata)).get("role", "assistant")
-                        part = as_dict(json.loads(pdata))
-                    except (TypeError, ValueError):
+                    message = parse_json_dict(mdata, budget)
+                    part = parse_json_dict(pdata, budget)
+                    if message is None or part is None:
                         continue
+                    role = message.get("role", "assistant")
                     if part.get("type") == "text" and usable_text(part.get("text", "")):
                         render_block(role, part["text"])
             except sqlite3.Error:
