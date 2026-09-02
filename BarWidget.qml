@@ -101,7 +101,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    readonly property string piGlyph: String.fromCodePoint(0xF0432)
+    readonly property string piGlyph: String.fromCodePoint(0xF06A9)  // nf-md-robot
     text: root.sessionPct >= 0 ? piGlyph + " " + root.sessionPct + "%" : piGlyph
     active: root.maxPct >= 90
     fontSize: Style.font.caption
