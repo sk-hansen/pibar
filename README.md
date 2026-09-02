@@ -1,3 +1,25 @@
+# Pi Bar — Omarchy bar widget
+
+One bar widget for a pi-based Claude Max workflow: **plan usage** on the bar
+(session %, click for meters) and **every AI coding session on this machine**
+in the same panel, resumable with Enter.
+
+Usage is read through **pi's own OAuth token** (`~/.pi/agent/auth.json`,
+read-only) against Anthropic's `api/oauth/usage` endpoint — no Claude Code
+login required. Responses are cached for 5 minutes (`~/.cache/pibar/`). The
+token is never written: pi owns refresh, so if it expires the widget says
+"open pi to refresh it".
+
+Bar: ` 10%` (session window; turns urgent at ≥90% on any limit).
+Middle-click refreshes usage. Panel: usage meters with reset countdowns on
+top, the session browser below.
+
+The session browser is a fork of
+[Sudhanshugtm/omarchy-session-browser](https://github.com/Sudhanshugtm/omarchy-session-browser)
+(MIT) — its collector, limits, and actions are unchanged. Upstream's docs below.
+
+---
+
 # Session Browser — Omarchy bar widget
 
 A native [Omarchy](https://omarchy.org/) bar panel that answers: **what AI

@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Claude plan usage via pi's OAuth token.
+
+Reads the Anthropic OAuth access token from ~/.pi/agent/auth.json (read-only;
+pi owns token refresh) and queries the undocumented oauth/usage endpoint.
+Responses are cached for 5 minutes to respect its strict rate limits.
+
+Output (JSON on stdout, always exits 0):
+  { "ok": true|false, "error": "...", "stale": true|false,
+    "fetched_at": epoch, "limits": [ {"name","pct","resets_at"} ... ] }
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+
+AUTH = os.path.expanduser("~/.pi/agent/auth.json")
+CACHE = os.path.expanduser("~/.cache/pibar/usage.json")
+URL = "https://api.anthropic.com/api/oauth/usage"
+CACHE_TTL = 300
+
+# response key -> display name (order matters; None-valued keys are skipped)
+WINDOWS = [
+    ("five_hour", "Session"),
+    ("seven_day", "Weekly"),
+    ("seven_day_opus", "Opus · weekly"),
+    ("seven_day_sonnet", "Sonnet · weekly"),
+]
+
+
+def emit(obj):
+    json.dump(obj, sys.stdout)
+    sys.exit(0)
+
+
+def read_json(path, limit=256 * 1024):
+    try:
+        with open(path) as f:
+            return json.loads(f.read(limit))
+    except (OSError, ValueError):
+        return None
+
+
+def parse(raw, fetched_at, stale=False):
+    limits = []
+    for key, name in WINDOWS:
+        w = raw.get(key)
+        if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
+            limits.append({
+                "name": name,
+                "pct": round(w["utilization"]),
+                "resets_at": w.get("resets_at") or "",
+            })
+    return {"ok": True, "stale": stale, "fetched_at": fetched_at, "limits": limits}
+
+
+cached = read_json(CACHE)
+if cached and time.time() - cached.get("fetched_at", 0) < CACHE_TTL:
+    emit(parse(cached["raw"], cached["fetched_at"]))
+
+auth = read_json(AUTH)
+token = ""
+if isinstance(auth, dict):
+    a = auth.get("anthropic")
+    if isinstance(a, dict):
+        token = str(a.get("access") or "")
+if not token or any(c in token for c in "\r\n\"\\") or len(token) > 512:
+    emit({"ok": False, "error": "No pi login — run pi and sign in to Anthropic"})
+if isinstance(a.get("expires"), (int, float)) and a["expires"] / 1000 < time.time():
+    if cached:
+        emit(parse(cached["raw"], cached["fetched_at"], stale=True))
+    emit({"ok": False, "error": "Token expired — open pi to refresh it"})
+
+req = urllib.request.Request(URL, headers={
+    "Authorization": "Bearer " + token,
+    "anthropic-beta": "oauth-2025-04-20",
+})
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = json.loads(resp.read(512 * 1024))
+except Exception:
+    if cached:  # network/API hiccup: keep showing the last good numbers
+        emit(parse(cached["raw"], cached["fetched_at"], stale=True))
+    emit({"ok": False, "error": "Usage fetch failed"})
+
+now = int(time.time())
+os.makedirs(os.path.dirname(CACHE), mode=0o700, exist_ok=True)
+tmp = CACHE + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"fetched_at": now, "raw": raw}, f)
+os.replace(tmp, CACHE)
+emit(parse(raw, now))

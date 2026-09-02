@@ -6,8 +6,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "sid.sessions"
-  ipcTarget: "sid.sessions"
+  moduleName: "skh.pibar"
+  ipcTarget: "skh.pibar"
 
   property var anchorItem: null
   property var hostWidget: null
@@ -55,6 +55,7 @@ Panel {
     root.hoverArmed = false
     hoverArm.restart()
     refresh()
+    if (root.hostWidget && root.hostWidget.refreshUsage) root.hostWidget.refreshUsage()
   }
   function openFromHotkey() { open() }
   function close() { root.controller.hide() }
@@ -154,6 +155,19 @@ Panel {
     onTriggered: if (actionProc.running) actionProc.running = false
   }
 
+  readonly property var usageData: hostWidget ? hostWidget.usage : null
+  readonly property var usageLimits: usageData && usageData.ok ? usageData.limits : []
+
+  function fmtReset(iso) {
+    if (!iso) return ""
+    var ms = Date.parse(iso) - Date.now()
+    if (isNaN(ms) || ms <= 0) return ""
+    var min = Math.round(ms / 60000)
+    if (min < 60) return "resets in " + min + " min"
+    if (min < 2880) return "resets in " + Math.floor(min / 60) + " h " + (min % 60) + " m"
+    return "resets in " + Math.round(min / 1440) + " d"
+  }
+
   function fmtAge(epoch) {
     var sec = Math.max(0, Math.round(Date.now() / 1000 - Number(epoch)))
     if (sec < 60) return "just now"
@@ -240,6 +254,86 @@ Panel {
         id: column
         width: parent.width
         spacing: Style.space(6)
+
+        // ---- Plan usage meters (from pi's OAuth token).
+        Column {
+          width: parent.width - Style.space(32)
+          x: Style.space(16)
+          topPadding: Style.space(14)
+          spacing: Style.space(8)
+
+          Repeater {
+            model: root.usageLimits
+
+            Item {
+              required property var modelData
+              readonly property color meterColor: modelData.pct >= 90 ? Color.urgent : Color.accent
+              width: parent.width
+              height: meterLabel.implicitHeight + Style.space(10)
+
+              Text {
+                id: meterLabel
+                anchors.left: parent.left
+                anchors.top: parent.top
+                text: modelData.name
+                color: root.fg
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.right: parent.right
+                anchors.top: parent.top
+                text: modelData.pct + "%"
+                  + (root.fmtReset(modelData.resets_at) !== "" ? "  ·  " + root.fmtReset(modelData.resets_at) : "")
+                color: modelData.pct >= 90 ? Color.urgent : root.dimmed
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: Style.space(4)
+                radius: height / 2
+                color: Qt.alpha(root.fg, 0.12)
+
+                Rectangle {
+                  anchors.left: parent.left
+                  anchors.top: parent.top
+                  anchors.bottom: parent.bottom
+                  width: parent.width * Math.min(1, Math.max(0, modelData.pct / 100))
+                  radius: parent.radius
+                  color: meterColor
+
+                  Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                }
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.usageData !== null && root.usageData.ok !== true
+            text: root.usageData && root.usageData.error ? root.usageData.error : ""
+            wrapMode: Text.WordWrap
+            color: root.dimmed
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width
+            visible: root.usageData !== null && root.usageData.stale === true
+            text: "Showing cached usage — refresh failed"
+            color: root.dimmed
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        PanelSeparator { width: parent.width }
 
         // ---- Hero: title + counts.
         Item {

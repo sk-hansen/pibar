@@ -1,17 +1,18 @@
 {
   "schemaVersion": 1,
-  "id": "sid.sessions",
-  "name": "Session Browser",
-  "version": "1.1.2",
-  "author": "Sudhanshu Gautam",
-  "description": "Browse previous sessions from every AI coding agent on this machine (Claude Code, Codex, opencode, Copilot, Pi, Gemini, Grok) and resume any of them in a terminal.",
+  "id": "skh.pibar",
+  "name": "Pi Bar",
+  "version": "0.1.0",
+  "author": "Simon Kaas Hansen",
+  "license": "MIT",
+  "description": "Claude Max plan usage (read through pi's OAuth token, no Claude Code needed) plus a browser for every AI coding session on this machine, in one bar panel.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Session Browser",
-    "description": "Click to open the session list; Enter or click a row resumes it in a terminal",
+    "displayName": "Pi Bar",
+    "description": "Bar shows plan usage; click for usage meters and the resumable session list",
     "category": "System",
     "defaultSection": "right",
     "allowMultiple": false
