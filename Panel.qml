@@ -289,7 +289,7 @@ Panel {
 
           Row {
             spacing: Style.space(6)
-            visible: root.usageProviders.length > 1
+            visible: root.usageProviders.length > 0
 
             Repeater {
               model: root.usageProviders
@@ -302,11 +302,11 @@ Panel {
                 width: tabRow.implicitWidth + Style.space(20)
                 height: tabText.implicitHeight + Style.space(10)
                 radius: height / 2
-                color: active ? meta.color
+                color: active ? Qt.alpha(meta.color, 0.25)
                   : (tabArea.containsMouse
                     ? Style.hoverFillFor(root.fg, Color.accent) : "transparent")
-                border.width: active ? 0 : 1
-                border.color: root.faint
+                border.width: 1
+                border.color: active ? meta.color : root.faint
 
                 Row {
                   id: tabRow
@@ -315,7 +315,7 @@ Panel {
 
                   Image {
                     anchors.verticalCenter: parent.verticalCenter
-                    visible: parent.parent.meta.iconFile !== "" && !parent.parent.active
+                    visible: parent.parent.meta.iconFile !== ""
                     source: parent.parent.meta.iconFile !== ""
                       ? Qt.resolvedUrl(parent.parent.meta.iconFile) : ""
                     width: Style.space(11)
@@ -329,7 +329,7 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
                     text: parent.parent.meta.name
                     textFormat: Text.PlainText
-                    color: parent.parent.active ? Color.background : root.fg
+                    color: root.fg
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.caption
                     font.bold: parent.parent.active
