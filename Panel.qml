@@ -463,7 +463,7 @@ Panel {
           width: parent.width - Style.space(32)
           x: Style.space(16)
           spacing: Style.space(6)
-          visible: root.agents.length > 1
+          visible: root.agents.length > 0
 
           Repeater {
             model: [{agent: "all", name: "All", count: root.sessions.length}].concat(root.agents)
