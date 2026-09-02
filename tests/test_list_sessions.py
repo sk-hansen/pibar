@@ -235,6 +235,22 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual({Path(row["id"]).name for row in rows},
                          {parent.name, fork.name})
 
+    def test_pi_title_from_block_list_content(self):
+        root = Path(".pi/agent/sessions/--tmp-project--")
+        self.write_jsonl(
+            root / "blocks.jsonl",
+            [
+                {"type": "session", "id": "blocks", "cwd": str(self.home)},
+                {"type": "message", "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Fix the login bug"}],
+                }},
+            ],
+        )
+
+        rows = list(SESSIONS.scan_pi())
+        self.assertEqual(rows[0]["title"], "Fix the login bug")
+
     def test_gemini_reads_json_and_jsonl_without_nested_children(self):
         project_root = self.home / "gemini-project"
         project_root.mkdir()

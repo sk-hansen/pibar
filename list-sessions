@@ -745,9 +745,9 @@ def scan_pi(budget=None):
             cwd = obj.get("cwd") or cwd
             msg = as_dict(obj.get("message"))
             if msg.get("role") == "user":
-                content = msg.get("content")
-                if isinstance(content, str) and usable_text(content):
-                    title = content
+                text = content_text(msg.get("content"))
+                if usable_text(text):
+                    title = text
                     break
         if not header or marked_subagent(header):
             continue
