@@ -10,9 +10,20 @@ login required. Responses are cached for 5 minutes (`~/.cache/pibar/`). The
 token is never written: pi owns refresh, so if it expires the widget says
 "open pi to refresh it".
 
-Bar: ` 10%` (session window; turns urgent at ≥90% on any limit).
-Middle-click refreshes usage. Panel: usage meters with reset countdowns on
-top, the session browser below.
+Bar: `󶙩 10%` (session window; turns urgent at ≥90% on any limit).
+Middle-click refreshes usage.
+
+Panel, top to bottom:
+
+- **Provider tabs** — logo pills (Claude, and Codex once `codex login` has
+  run; Codex limits come from Omarchy's stock `omarchy-agent-usage-codex`
+  collector). Click a tab to see that plan's meters.
+- **Usage meters** — every limit the API reports (session, weekly, and
+  per-model such as Opus/Sonnet/Fable) with reset countdowns; red at ≥90%.
+- **Session browser** — all agents' sessions with logo filter pills, plus a
+  `/` search field that filters by project folder or title. Enter resumes
+  the selected session in a terminal (via `xdg-terminal-exec`), in its
+  original working directory.
 
 ![The Pi Bar panel: Claude usage tab with meters, and the session browser](preview.png)
 
