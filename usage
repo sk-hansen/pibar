@@ -69,7 +69,8 @@ def codex_limits():
     for entry in (rec.get("limits") or [])[:4]:
         if isinstance(entry, dict) and isinstance(entry.get("percent"), (int, float)):
             limits.append({
-                "name": "Codex \u00b7 " + str(entry.get("label") or "limit")[:24],
+                "provider": "codex",
+                "name": str(entry.get("label") or "Limit")[:24],
                 "pct": round(entry["percent"] * 100),  # collector emits a 0-1 fraction
                 "resets_at": str(entry.get("resetsAt") or ""),
             })
@@ -83,6 +84,7 @@ def parse(raw, fetched_at, stale=False):
         for entry in entries[:8]:
             if isinstance(entry, dict) and isinstance(entry.get("percent"), (int, float)):
                 limits.append({
+                    "provider": "claude",
                     "name": limit_name(entry),
                     "pct": round(entry["percent"]),
                     "resets_at": str(entry.get("resets_at") or ""),
@@ -92,6 +94,7 @@ def parse(raw, fetched_at, stale=False):
             w = raw.get(key)
             if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
                 limits.append({
+                    "provider": "claude",
                     "name": name,
                     "pct": round(w["utilization"]),
                     "resets_at": w.get("resets_at") or "",

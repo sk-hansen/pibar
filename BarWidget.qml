@@ -106,7 +106,9 @@ BarWidget {
     active: root.maxPct >= 90
     fontSize: Style.font.caption
     tooltipText: root.usage && root.usage.ok
-      ? root.usageLimits.map(l => l.name + " " + l.pct + "%").join(" · ")
+      ? root.usageLimits.map(l => ((l.provider || "claude") !== "claude"
+          ? l.provider.charAt(0).toUpperCase() + l.provider.slice(1) + " " : "")
+          + l.name + " " + l.pct + "%").join(" · ")
         + (root.usage.stale ? " · stale" : "")
       : (root.usage && root.usage.error ? root.usage.error : "Pi Bar — usage & sessions")
 

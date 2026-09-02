@@ -161,7 +161,26 @@ Panel {
   }
 
   readonly property var usageData: hostWidget ? hostWidget.usage : null
-  readonly property var usageLimits: usageData && usageData.ok ? usageData.limits : []
+  readonly property var allUsageLimits: usageData && usageData.ok ? usageData.limits : []
+
+  // ---- Usage provider tabs (Claude / Codex), shown when more than one reports.
+  readonly property var providerMeta: ({
+    claude: { name: "Claude", iconFile: "icons/claude.svg", color: "#D97757" },
+    codex:  { name: "Codex",  iconFile: "icons/openai.svg", color: "#10A37F" }
+  })
+  property string usageTab: ""
+  readonly property var usageProviders: {
+    var seen = []
+    for (var i = 0; i < allUsageLimits.length; i++) {
+      var p = allUsageLimits[i].provider || "claude"
+      if (seen.indexOf(p) < 0) seen.push(p)
+    }
+    return seen
+  }
+  readonly property string activeUsageTab: usageProviders.indexOf(usageTab) >= 0
+    ? usageTab : (usageProviders.length > 0 ? usageProviders[0] : "")
+  readonly property var usageLimits: allUsageLimits.filter(l =>
+    (l.provider || "claude") === root.activeUsageTab)
 
   function fmtReset(iso) {
     if (!iso) return ""
@@ -267,6 +286,66 @@ Panel {
           x: Style.space(16)
           topPadding: Style.space(14)
           spacing: Style.space(8)
+
+          Row {
+            spacing: Style.space(6)
+            visible: root.usageProviders.length > 1
+
+            Repeater {
+              model: root.usageProviders
+
+              Rectangle {
+                required property var modelData
+                readonly property var meta: root.providerMeta[modelData]
+                  || ({ name: modelData, iconFile: "", color: Color.accent })
+                readonly property bool active: root.activeUsageTab === modelData
+                width: tabRow.implicitWidth + Style.space(20)
+                height: tabText.implicitHeight + Style.space(10)
+                radius: height / 2
+                color: active ? meta.color
+                  : (tabArea.containsMouse
+                    ? Style.hoverFillFor(root.fg, Color.accent) : "transparent")
+                border.width: active ? 0 : 1
+                border.color: root.faint
+
+                Row {
+                  id: tabRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(5)
+
+                  Image {
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: parent.parent.meta.iconFile !== "" && !parent.parent.active
+                    source: parent.parent.meta.iconFile !== ""
+                      ? Qt.resolvedUrl(parent.parent.meta.iconFile) : ""
+                    width: Style.space(11)
+                    height: Style.space(11)
+                    sourceSize: Qt.size(Style.space(11) * 2, Style.space(11) * 2)
+                    smooth: true
+                  }
+
+                  Text {
+                    id: tabText
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: parent.parent.meta.name
+                    textFormat: Text.PlainText
+                    color: parent.parent.active ? Color.background : root.fg
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                    font.bold: parent.parent.active
+                  }
+                }
+
+                MouseArea {
+                  id: tabArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.usageTab = parent.modelData
+                }
+              }
+            }
+          }
 
           Repeater {
             model: root.usageLimits
