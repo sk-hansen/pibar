@@ -20,13 +20,13 @@ CACHE = os.path.expanduser("~/.cache/pibar/usage.json")
 URL = "https://api.anthropic.com/api/oauth/usage"
 CACHE_TTL = 300
 
-# response key -> display name (order matters; None-valued keys are skipped)
+# Fallback windows if the response carries no `limits` array
 WINDOWS = [
     ("five_hour", "Session"),
     ("seven_day", "Weekly"),
-    ("seven_day_opus", "Opus · weekly"),
-    ("seven_day_sonnet", "Sonnet · weekly"),
 ]
+
+KIND_NAMES = {"session": "Session", "weekly_all": "Weekly"}
 
 
 def emit(obj):
@@ -42,16 +42,38 @@ def read_json(path, limit=256 * 1024):
         return None
 
 
+def limit_name(entry):
+    kind = str(entry.get("kind") or "")
+    if kind in KIND_NAMES:
+        return KIND_NAMES[kind]
+    scope = entry.get("scope") or {}
+    model = scope.get("model") if isinstance(scope, dict) else None
+    if isinstance(model, dict) and model.get("display_name"):
+        window = "weekly" if kind.startswith("weekly") else kind
+        return str(model["display_name"])[:32] + " \u00b7 " + window
+    return kind.replace("_", " ").capitalize() or "Limit"
+
+
 def parse(raw, fetched_at, stale=False):
     limits = []
-    for key, name in WINDOWS:
-        w = raw.get(key)
-        if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
-            limits.append({
-                "name": name,
-                "pct": round(w["utilization"]),
-                "resets_at": w.get("resets_at") or "",
-            })
+    entries = raw.get("limits")
+    if isinstance(entries, list):
+        for entry in entries[:8]:
+            if isinstance(entry, dict) and isinstance(entry.get("percent"), (int, float)):
+                limits.append({
+                    "name": limit_name(entry),
+                    "pct": round(entry["percent"]),
+                    "resets_at": str(entry.get("resets_at") or ""),
+                })
+    if not limits:  # older/odd response shape: fall back to the fixed windows
+        for key, name in WINDOWS:
+            w = raw.get(key)
+            if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
+                limits.append({
+                    "name": name,
+                    "pct": round(w["utilization"]),
+                    "resets_at": w.get("resets_at") or "",
+                })
     return {"ok": True, "stale": stale, "fetched_at": fetched_at, "limits": limits}
 
 
