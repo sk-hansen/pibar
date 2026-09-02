@@ -14,9 +14,15 @@ Bar: ` 10%` (session window; turns urgent at ≥90% on any limit).
 Middle-click refreshes usage. Panel: usage meters with reset countdowns on
 top, the session browser below.
 
-The session browser is a fork of
-[Sudhanshugtm/omarchy-session-browser](https://github.com/Sudhanshugtm/omarchy-session-browser)
-(MIT) — its collector, limits, and actions are unchanged. Upstream's docs below.
+![The Pi Bar panel: Claude usage tab with meters, and the session browser](preview.png)
+
+## Credits & inspiration
+
+- [Sudhanshugtm/omarchy-session-browser](https://github.com/Sudhanshugtm/omarchy-session-browser) (MIT) — Pi Bar is a fork of it; the session collector, its safety limits, and the panel actions are unchanged. Upstream's docs below.
+- [mryll/claudebar](https://github.com/mryll/claudebar) (MIT) — the inspiration for the plan-usage side, and for the trick of driving meters straight from the OAuth usage endpoint.
+- [acrogenesis/omarchy-ai-account-switcher](https://github.com/acrogenesis/omarchy-ai-account-switcher) (MIT) — inspiration for the provider-tab layout.
+- Omarchy's built-in `omarchy-agent-usage-codex` collector supplies the Codex limits.
+- Agent logos from [Simple Icons](https://simpleicons.org/) (CC0); the pi mark is from [pi.dev](https://pi.dev/). Trademarks remain their owners' and appear for identification only.
 
 ---
 
