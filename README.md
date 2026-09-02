@@ -126,7 +126,7 @@ python3 -m unittest discover -s tests -v
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/Sudhanshugtm/omarchy-session-browser.git --enable
+omarchy plugin add https://github.com/sk-hansen/pibar.git --enable
 ```
 
 ## Use
@@ -144,12 +144,12 @@ omarchy plugin add https://github.com/Sudhanshugtm/omarchy-session-browser.git -
 | `r` | Rescan |
 | `Esc` | Close panel |
 
-IPC target for keybindings: `omarchy-shell sid.sessions toggle`.
+IPC target for keybindings: `omarchy-shell skh.pibar toggle`.
 
 ## Remove
 
 ```bash
-omarchy plugin remove sid.sessions
+omarchy plugin remove skh.pibar
 ```
 
 Deletes the plugin folder and removes the widget from the bar. Your agents'
