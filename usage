@@ -11,6 +11,7 @@ Output (JSON on stdout, always exits 0):
 """
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -54,6 +55,27 @@ def limit_name(entry):
     return kind.replace("_", " ").capitalize() or "Limit"
 
 
+def codex_limits():
+    """Codex plan limits via Omarchy's stock collector; [] when absent/logged out."""
+    exe = "/usr/share/omarchy/bin/omarchy-agent-usage-codex"
+    if not os.access(exe, os.X_OK):
+        return []
+    try:
+        out = subprocess.run([exe], capture_output=True, timeout=8).stdout
+        rec = json.loads(out[:512 * 1024])
+    except Exception:
+        return []
+    limits = []
+    for entry in (rec.get("limits") or [])[:4]:
+        if isinstance(entry, dict) and isinstance(entry.get("percent"), (int, float)):
+            limits.append({
+                "name": "Codex \u00b7 " + str(entry.get("label") or "limit")[:24],
+                "pct": round(entry["percent"] * 100),  # collector emits a 0-1 fraction
+                "resets_at": str(entry.get("resetsAt") or ""),
+            })
+    return limits
+
+
 def parse(raw, fetched_at, stale=False):
     limits = []
     entries = raw.get("limits")
@@ -74,7 +96,8 @@ def parse(raw, fetched_at, stale=False):
                     "pct": round(w["utilization"]),
                     "resets_at": w.get("resets_at") or "",
                 })
-    return {"ok": True, "stale": stale, "fetched_at": fetched_at, "limits": limits}
+    return {"ok": True, "stale": stale, "fetched_at": fetched_at,
+            "limits": limits + codex_limits()}
 
 
 cached = read_json(CACHE)
