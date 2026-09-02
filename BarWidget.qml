@@ -101,7 +101,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.sessionPct >= 0 ? "\uf120 " + root.sessionPct + "%" : "\uf120"
+    readonly property string piGlyph: String.fromCodePoint(0xF0432)
+    text: root.sessionPct >= 0 ? piGlyph + " " + root.sessionPct + "%" : piGlyph
     active: root.maxPct >= 90
     fontSize: Style.font.caption
     tooltipText: root.usage && root.usage.ok

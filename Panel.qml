@@ -47,6 +47,11 @@ Panel {
     var list = root.filter === "all"
       ? root.sessions
       : root.sessions.filter(s => s.agent === root.filter)
+    var q = searchInput.text.trim().toLowerCase()
+    if (q !== "")
+      list = list.filter(s =>
+        (String(s.title) + " " + String(s.dir || "") + " " + String(s.dirShort || ""))
+          .toLowerCase().indexOf(q) >= 0)
     return list
   }
 
@@ -243,7 +248,8 @@ Panel {
       onReturnRequested: root.resumeSelected()
       onActivateRequested: root.resumeSelected()
       onTextKey: function(text) {
-        if (text === "r") root.refresh()
+        if (text === "/") { searchInput.forceActiveFocus(); searchInput.selectAll() }
+        else if (text === "r") root.refresh()
         else if (text === "p") root.runAction("peek", root.selected())
         else if (text === "o") root.runAction("folder", root.selected())
         else if (text === "y") root.runAction("copy", root.selected())
@@ -437,6 +443,21 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        // ---- Search: filter sessions by project folder or title.
+        TextField {
+          id: searchInput
+          width: parent.width - Style.space(32)
+          x: Style.space(16)
+          placeholderText: "/ filter by folder or text"
+          font.pixelSize: Style.font.caption
+          onTextChanged: root.selectedIndex = 0
+          onAccepted: keyCatcher.forceActiveFocus()
+          Keys.onEscapePressed: {
+            if (text !== "") text = ""
+            else keyCatcher.forceActiveFocus()
           }
         }
 
@@ -666,7 +687,7 @@ Panel {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
-            text: "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · r rescan · esc"
+            text: "↵ resume · / filter · p peek · o folder · y copy · d delete ×2 · ←/→ agent · r rescan · esc"
             color: root.dimmed
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption

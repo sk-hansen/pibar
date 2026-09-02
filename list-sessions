@@ -55,8 +55,8 @@ AGENTS = {
                  "icon": chr(0xF018D), "color": "#E5C07B"},
     "copilot":  {"name": "Copilot",     "badge": "CP", "iconFile": "icons/githubcopilot.svg",
                  "icon": chr(0xF4B8), "color": "#8957E5"},
-    "pi":       {"name": "Pi",          "badge": "PI", "iconFile": "",
-                 "icon": chr(0xF0432), "color": "#E06C75"},  # no official logo; π glyph
+    "pi":       {"name": "Pi",          "badge": "PI", "iconFile": "icons/pi.svg",
+                 "icon": chr(0xF0432), "color": "#E06C75"},  # π mark (no official logo)
     "gemini":   {"name": "Gemini",      "badge": "GM", "iconFile": "icons/googlegemini.svg",
                  "icon": chr(0xEB54), "color": "#4796E3"},
     "grok":     {"name": "Grok",        "badge": "GR", "iconFile": "",
