@@ -61,6 +61,7 @@ Panel {
     hoverArm.restart()
     refresh()
     if (root.hostWidget && root.hostWidget.refreshUsage) root.hostWidget.refreshUsage()
+    if (!usageUpdateProc.running) usageUpdateProc.running = true
   }
   function openFromHotkey() { open() }
   function close() { root.controller.hide() }
@@ -181,6 +182,73 @@ Panel {
     ? usageTab : (usageProviders.length > 0 ? usageProviders[0] : "")
   readonly property var usageLimits: allUsageLimits.filter(l =>
     (l.provider || "claude") === root.activeUsageTab)
+
+  // ---- Tokens by model, reusing Omarchy's stock collector records
+  // (omarchy-agent-usage-update writes one JSON per agent into this dir).
+  readonly property string usageRecordDir:
+    (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
+    + "/omarchy/agents/usage"
+  property var usageRecord: null
+
+  FileView {
+    path: root.activeUsageTab !== ""
+      ? root.usageRecordDir + "/" + root.activeUsageTab + ".json" : ""
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(String(text() || ""))
+        root.usageRecord = parsed && typeof parsed === "object" ? parsed : null
+      } catch (e) { root.usageRecord = null }
+    }
+    onLoadFailed: root.usageRecord = null
+  }
+
+  readonly property var modelRows: {
+    var usage = root.usageRecord ? (root.usageRecord.modelUsage || {}) : {}
+    var rows = []
+    for (var id in usage) {
+      var b = usage[id] || {}
+      var input = Number(b.inputTokens || 0)
+      var output = Number(b.outputTokens || 0)
+      var cacheRead = Number(b.cacheReadInputTokens || 0)
+      var cacheWrite = Number(b.cacheCreationInputTokens || 0)
+      rows.push({
+        name: root.friendlyModelName(id),
+        total: input + output + cacheRead + cacheWrite,
+        input: input,
+        output: output
+      })
+    }
+    rows.sort(function(a, b) { return b.total - a.total })
+    return rows.slice(0, 4)
+  }
+
+  function friendlyModelName(id) {
+    if (!id) return "Unknown"
+    var parts = String(id).replace(/^claude-/, "").replace(/-\d{8}$/, "").split("-")
+    var words = []
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i]
+      if (p === "") continue
+      words.push(/^\d/.test(p) ? p : p.charAt(0).toUpperCase() + p.slice(1))
+    }
+    return words.length > 0 ? words.join(" ") : "Unknown"
+  }
+
+  function fmtTokens(n) {
+    n = Number(n) || 0
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
+    if (n >= 1e3) return Math.round(n / 1e3) + "K"
+    return String(n)
+  }
+
+  Process {
+    id: usageUpdateProc
+    command: ["omarchy-agent-usage-update"]
+  }
 
   function fmtReset(iso) {
     if (!iso) return ""
@@ -415,6 +483,46 @@ Panel {
             color: root.dimmed
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
+          }
+
+          // ---- Tokens by model (Omarchy collector data).
+          Text {
+            visible: root.modelRows.length > 0
+            text: "TOKENS BY MODEL"
+            color: root.faint
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          Repeater {
+            model: root.modelRows
+
+            Item {
+              required property var modelData
+              width: parent.width
+              height: modelName.implicitHeight + Style.space(2)
+
+              Text {
+                id: modelName
+                anchors.left: parent.left
+                text: modelData.name
+                textFormat: Text.PlainText
+                color: root.fg
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.right: parent.right
+                text: root.fmtTokens(modelData.total)
+                  + "  ·  in " + root.fmtTokens(modelData.input)
+                  + " · out " + root.fmtTokens(modelData.output)
+                color: root.dimmed
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
           }
         }
 
